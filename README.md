@@ -2,10 +2,14 @@
 
 A macOS desktop widget for the DeepSeek Harness desktop app: keep the current session on your desktop, send messages without switching windows, and watch streaming replies.
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 > Unofficial community project. Not affiliated with DeepSeek.
 > Early release: **Apple Silicon / macOS 14+**, ad-hoc signed and **not notarized**.
 
 ![status](https://img.shields.io/badge/status-early%20preview-orange)
+
+**Latest release:** [v0.1.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.1.0)
 
 ## What it does
 
@@ -126,18 +130,6 @@ The bridge does not duplicate DSH business logic; it exposes existing session ca
 - Desktop window level: full-screen apps cover the widget by design.
 - No protocol version negotiation; a future DSH release may change the plugin API.
 - Full history is capped at 200 pages; the UI reports when more remains.
-
-## 中文说明
-
-这是一个把 DeepSeek Harness 当前会话放到 macOS 桌面的小组件：右上角常驻、直接发消息、看流式回复、切换会话，窗口位于桌面层级，不浮在普通窗口之上。
-
-安装分两步：先克隆源码并执行 `./src/scripts/install.sh` 安装桥插件，再 **完全退出并重开 DSH**；然后从 Release 下载 DMG，把 App 拖进“应用程序”。当前版本仅支持 Apple Silicon 和 macOS 14+，使用 ad-hoc 签名、未公证，首次打开需右键“打开”或在终端执行：
-
-```bash
-xattr -dr com.apple.quarantine /Applications/DSHWidget.app
-```
-
-DMG 里只有 App，桥插件必须从源码安装。详细步骤见上方 Install。
 
 ## License
 
