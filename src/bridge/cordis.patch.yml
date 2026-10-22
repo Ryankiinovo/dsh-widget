@@ -1,0 +1,4 @@
+# dsh bundle patch: mount the local desktop-widget bridge.
+- insert:
+    - id: dsh-widget-bridge
+      name: 'dsh-widget-bridge'

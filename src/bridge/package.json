@@ -1,0 +1,13 @@
+{
+  "name": "dsh-widget-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-only bridge between a macOS desktop widget and DeepSeek Harness sessions.",
+  "main": "index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
