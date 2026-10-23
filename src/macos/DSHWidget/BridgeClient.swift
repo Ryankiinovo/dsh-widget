@@ -134,7 +134,7 @@ final class BridgeClient {
             request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
             request.timeoutInterval = 3600
             let stream = SSEStream()
-            stream.start(request: request, continuation: continuation)
+            stream.start(request: request, sessionId: sessionId, continuation: continuation)
             continuation.onTermination = { _ in
                 stream.stop()
             }
@@ -179,27 +179,38 @@ private final class SSEStream: NSObject, URLSessionDataDelegate {
     private var eventName = "message"
     private var dataLines: [String] = []
     private var finished = false
+    private let stateLock = NSLock()
+    private var lastActivity = Date()
+    private var watchdog: DispatchSourceTimer?
+    private var sessionId = "?"
 
-    func start(request: URLRequest, continuation: AsyncThrowingStream<WidgetEvent, Error>.Continuation) {
+    func start(
+        request: URLRequest,
+        sessionId: String,
+        continuation: AsyncThrowingStream<WidgetEvent, Error>.Continuation
+    ) {
         self.continuation = continuation
+        self.sessionId = sessionId
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 3600
-        config.timeoutIntervalForResource = 3600
+        // The bridge heartbeats every 15s, so an hour-long resource timeout only
+        // guarantees a hard disconnect every hour. Keep the resource limit long
+        // and let the stall watchdog below decide when a stream is dead.
+        config.timeoutIntervalForResource = 86400
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         self.session = session
         let task = session.dataTask(with: request)
         self.task = task
+        WidgetLog.event("stream-open", "session=\(sessionId)")
+        startWatchdog()
         task.resume()
     }
 
     func stop() {
         guard !finished else { return }
         finished = true
-        task?.cancel()
-        session?.invalidateAndCancel()
-        task = nil
-        session = nil
+        teardown()
         continuation = nil
     }
 
@@ -207,15 +218,63 @@ private final class SSEStream: NSObject, URLSessionDataDelegate {
         guard !finished else { return }
         finished = true
         if let error {
+            let code = (error as NSError).code
+            WidgetLog.event("stream-end", "session=\(sessionId) error=\(code)")
             continuation?.finish(throwing: error)
         } else {
+            WidgetLog.event("stream-end", "session=\(sessionId) reason=closed")
             continuation?.finish()
         }
         continuation = nil
+        teardown()
+    }
+
+    private func teardown() {
+        watchdog?.cancel()
+        watchdog = nil
         task?.cancel()
         session?.invalidateAndCancel()
         task = nil
         session = nil
+    }
+
+    private func noteActivity() {
+        stateLock.lock()
+        lastActivity = Date()
+        stateLock.unlock()
+    }
+
+    private func idleSeconds() -> TimeInterval {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return Date().timeIntervalSince(lastActivity)
+    }
+
+    /// URLSession only reports a dead connection when TCP gives up, which can
+    /// take many minutes after sleep or a bridge restart. Treat 60s without a
+    /// single byte (four missed heartbeats) as a dead stream so the model can
+    /// reconnect and reconcile instead of showing a spinner forever.
+    private var stallTimeout: TimeInterval {
+        if let raw = ProcessInfo.processInfo.environment["DSHWIDGET_STALL_SECONDS"],
+           let value = TimeInterval(raw), value > 0 {
+            return value
+        }
+        return 60
+    }
+
+    private func startWatchdog() {
+        noteActivity()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            let idle = self.idleSeconds()
+            guard idle > self.stallTimeout else { return }
+            WidgetLog.event("stream-stall", "session=\(self.sessionId) idle=\(Int(idle))s")
+            self.finish(nil)
+        }
+        timer.resume()
+        watchdog = timer
     }
 
     func urlSession(
@@ -235,10 +294,12 @@ private final class SSEStream: NSObject, URLSessionDataDelegate {
             finish(BridgeError.badStatus(http.statusCode, body.isEmpty ? "SSE 请求失败" : body))
             return
         }
+        noteActivity()
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        noteActivity()
         buffer.append(data)
         processBuffer()
     }

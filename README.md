@@ -1,5 +1,7 @@
 # DSH Widget
 
+**English** · [简体中文](README.zh-CN.md)
+
 A macOS desktop widget for the DeepSeek Harness desktop app: keep the current session on your desktop, send messages without switching windows, and watch streaming replies.
 
 [English](README.md) | [简体中文](README.zh-CN.md)
@@ -15,7 +17,7 @@ A macOS desktop widget for the DeepSeek Harness desktop app: keep the current se
 
 - Resides at the desktop window level: below normal app windows, above the wallpaper.
 - Lists sessions in the current workspace and switches between them.
-- Sends prompts and renders streaming assistant replies.
+- Sends prompts and renders streaming assistant replies. The composer supports multiple lines: **Enter sends, Shift+Enter inserts a newline**.
 - Loads full session history (paged) and keeps a local cache; a sync button fills gaps after disconnects.
 - Supports basic Markdown: paragraphs, headings, lists, quotes, rules, code blocks, bold/italic/inline code and links.
 - Shows a workspace menu and can create a new session in the current workspace.

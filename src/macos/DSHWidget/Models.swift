@@ -161,8 +161,15 @@ enum WidgetEvent {
 }
 
 enum Discovery {
-    static let path = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".dsh/widget-bridge.json")
+    /// Tests point `DSHWIDGET_DISCOVERY` at a throwaway discovery file so they
+    /// never talk to the real bridge.
+    static var path: URL {
+        if let override = ProcessInfo.processInfo.environment["DSHWIDGET_DISCOVERY"], !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".dsh/widget-bridge.json")
+    }
 
     static func load() -> DiscoveryInfo? {
         guard let data = try? Data(contentsOf: path) else { return nil }

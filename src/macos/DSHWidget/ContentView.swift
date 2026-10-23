@@ -24,7 +24,7 @@ struct VisualEffectView: NSViewRepresentable {
 struct ContentView: View {
     @ObservedObject var model: WidgetModel
     var onClose: () -> Void
-    @FocusState private var composerFocused: Bool
+    @StateObject private var keyMonitor = ComposerKeyMonitor()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -47,6 +47,18 @@ struct ContentView: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(Color.white.opacity(0.12), lineWidth: 1)
         )
+        .onAppear {
+            keyMonitor.onSend = { model.send() }
+            keyMonitor.install()
+            if ProcessInfo.processInfo.environment["DSHWIDGET_TEST"] == "1" {
+                // Synthetic keystrokes follow the frontmost app; make the test
+                // build frontmost so its keys cannot land in another window.
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        }
+        .onDisappear {
+            keyMonitor.uninstall()
+        }
     }
 
     private var header: some View {
@@ -193,17 +205,19 @@ struct ContentView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextField("发消息…", text: $model.input, axis: .vertical)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13))
-                .lineLimit(1...5)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .focused($composerFocused)
-                .onSubmit {
-                    model.send()
+            ZStack(alignment: .topLeading) {
+                ComposerTextEditor(text: $model.input)
+                    .frame(height: 62)
+                if model.input.isEmpty {
+                    Text("发消息…（Shift+Enter 换行）")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.tertiary)
+                        .padding(.leading, 9)
+                        .padding(.top, 6)
+                        .allowsHitTesting(false)
                 }
+            }
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             if model.isRunning {
                 Button {
@@ -228,7 +242,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(model.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .help("发送")
+                .help("发送（Enter），Shift+Enter 换行")
             }
         }
         .padding(.horizontal, 12)

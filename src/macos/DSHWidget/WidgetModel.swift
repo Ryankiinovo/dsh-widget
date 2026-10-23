@@ -49,6 +49,9 @@ final class WidgetModel: ObservableObject {
     private var refreshTask: Task<Void, Never>?
     private var streamingID: String?
     private var streamFailures = 0
+    private var reconcileTask: Task<Void, Never>?
+    private var isTailSyncing = false
+    private var idleTicks = 0
     private var autoSyncAfterReconnect = false
     private var syncTask: Task<Void, Never>?
     private var syncStatusTask: Task<Void, Never>?
@@ -58,6 +61,8 @@ final class WidgetModel: ObservableObject {
     private var fullHistoryOrder: [String] = []
     private var fullHistoryLoaded: Set<String> = []
     private let selectedKey = "dshWidget.selectedSession"
+    /// Test runs must not disturb the real app's remembered session.
+    private let isTestRun = ProcessInfo.processInfo.environment["DSHWIDGET_TEST"] == "1"
     private let defaultCwd = NSHomeDirectory() + "/Documents/AI-Work"
     private let workspaceRegistryPath = NSHomeDirectory() + "/.dsh/storages/workspace.json"
     /// DSH's registry-global archive set. Archived sessions stay out of every
@@ -78,6 +83,7 @@ final class WidgetModel: ObservableObject {
         syncStatusTask?.cancel()
         connectTask?.cancel()
         refreshTask?.cancel()
+        reconcileTask?.cancel()
     }
 
     func start() {
@@ -98,12 +104,14 @@ final class WidgetModel: ObservableObject {
         syncTask?.cancel()
         syncStatusTask?.cancel()
         refreshTask?.cancel()
+        reconcileTask?.cancel()
         connectTask?.cancel()
         streamTask = nil
         historyTask = nil
         syncTask = nil
         syncStatusTask = nil
         refreshTask = nil
+        reconcileTask = nil
         connectTask = nil
         client = nil
         isSyncingHistory = false
@@ -118,6 +126,7 @@ final class WidgetModel: ObservableObject {
         syncStatusTask?.cancel()
         connectTask?.cancel()
         refreshTask?.cancel()
+        reconcileTask?.cancel()
     }
 
     var selectedSession: SessionSummary? {
@@ -260,17 +269,20 @@ final class WidgetModel: ObservableObject {
                     loadWorkspaces()
                     connection = .connected
                     errorText = nil
+                    WidgetLog.event("connected", "sessions=\(listed.count)")
                     if selectedSessionID == nil || !listed.contains(where: { $0.id == selectedSessionID }) {
                         selectedSessionID = listed.first?.id
                     }
                     if let id = selectedSessionID {
-                        UserDefaults.standard.set(id, forKey: selectedKey)
+                        saveSelection(id)
                         isRunning = listed.first(where: { $0.id == id })?.running ?? false
                         startSession(id)
                     }
                     startRefresh()
+                    startReconcile()
                     return
                 } catch {
+                    WidgetLog.event("connect-failed", "error=\((error as NSError).code)")
                     connection = .offline
                 }
             } else {
@@ -289,6 +301,118 @@ final class WidgetModel: ObservableObject {
                 await self?.refreshSessions()
             }
         }
+    }
+
+    /// The event stream can die without `assistant_end` (idle timeout, sleep,
+    /// bridge restart). Poll cheaply while something still looks busy: after two
+    /// consecutive idle answers from /v1/sessions, settle the transcript and
+    /// reconcile the tail from /history.
+    private func startReconcile() {
+        reconcileTask?.cancel()
+        reconcileTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                if Task.isCancelled { return }
+                await self?.reconcileIfBusy()
+            }
+        }
+    }
+
+    private var hasStreamingBubble: Bool {
+        messages.contains { $0.role == "assistant" && $0.streaming }
+    }
+
+    private func reconcileIfBusy() async {
+        guard connection == .connected,
+              let client,
+              let id = selectedSessionID else {
+            idleTicks = 0
+            return
+        }
+        guard isRunning || hasStreamingBubble else {
+            // The first poll already turned isRunning off but a lost end frame
+            // can leave a spinner behind; give it one more tick, then settle.
+            if idleTicks > 0 {
+                idleTicks += 1
+                if idleTicks >= 2 { settleTranscript(reason: "reconcile") }
+            }
+            return
+        }
+        do {
+            let listed = try await client.listSessions()
+            sessions = listed
+            loadWorkspaces()
+            guard selectedSessionID == id else { return }
+            if let current = listed.first(where: { $0.id == id }) {
+                isRunning = current.running
+            }
+            guard !isRunning else {
+                idleTicks = 0
+                return
+            }
+            idleTicks += 1
+            WidgetLog.event("reconcile", "idle=\(idleTicks) streaming=\(hasStreamingBubble)")
+            if idleTicks >= 2 {
+                settleTranscript(reason: "reconcile")
+            }
+        } catch {
+            // refreshSessions owns the offline transition.
+        }
+    }
+
+    /// Collapse the leftovers of an interrupted stream once the session is known
+    /// to be idle, then pull whatever the event window missed.
+    private func settleTranscript(reason: String) {
+        let before = messages.count
+        let streamingBefore = hasStreamingBubble
+        messages = Transcript.settling(messages)
+        streamingID = nil
+        idleTicks = 0
+        cacheCurrentIfLoaded()
+        let lastLength = messages.last(where: { $0.role == "assistant" })?.text.count ?? 0
+        WidgetLog.event(
+            "settle",
+            "reason=\(reason) before=\(before) after=\(messages.count) streaming=\(streamingBefore) last=\(lastLength)"
+        )
+        if messages.count != before { scrollTick += 1 }
+        silentSyncHistory(reason: reason)
+    }
+
+    /// Fetch only messages newer than the newest sequence on screen, without
+    /// touching the sync banner: this runs automatically after a reconnect.
+    private func silentSyncHistory(reason: String) {
+        guard let client,
+              let id = selectedSessionID,
+              connection == .connected,
+              !isTailSyncing,
+              !isLoadingHistory else { return }
+        let after = lastMessageSeq
+        isTailSyncing = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isTailSyncing = false }
+            do {
+                let page = try await client.history(sessionId: id, all: after == nil, after: after)
+                guard !Task.isCancelled, self.selectedSessionID == id else { return }
+                let result = Transcript.addingSynced(to: self.messages, history: page.messages)
+                if result.added > 0 {
+                    self.messages = result.messages
+                    self.cacheCurrentIfLoaded()
+                    self.scrollTick += 1
+                }
+                WidgetLog.event(
+                    "tail-sync",
+                    "reason=\(reason) fetched=\(page.messages.count) added=\(result.added)"
+                )
+            } catch {
+                WidgetLog.event("tail-sync-failed", "reason=\(reason) error=\((error as NSError).code)")
+            }
+        }
+    }
+
+    private func saveSelection(_ id: String) {
+        guard !isTestRun else { return }
+        UserDefaults.standard.set(id, forKey: selectedKey)
     }
 
     func refreshSessions() async {
@@ -316,7 +440,7 @@ final class WidgetModel: ObservableObject {
             fullHistoryCache[current] = messages
         }
         selectedSessionID = id
-        UserDefaults.standard.set(id, forKey: selectedKey)
+        saveSelection(id)
         messages = []
         errorText = nil
         syncStatus = nil
@@ -395,37 +519,8 @@ final class WidgetModel: ObservableObject {
             }
             return true
         }
-        messages = deduplicated(history + live)
+        messages = Transcript.deduped(history + live)
         scrollTick += 1
-    }
-
-    /// DSH can deliver the same assistant step twice: once from /history and
-    /// once from the live stream, especially when a reconnect or a slow
-    /// history request overlaps streaming. Keep one bubble per turn/step.
-    /// Assistant messages without turn/step are left alone because they may be
-    /// separate attempts.
-    private func deduplicated(_ list: [ChatMessage]) -> [ChatMessage] {
-        var result: [ChatMessage] = []
-        var positions: [String: Int] = [:]
-        for message in list {
-            guard message.role == "assistant",
-                  let turn = message.turn,
-                  let step = message.step else {
-                result.append(message)
-                continue
-            }
-            let key = "\(turn)|\(step)"
-            if let index = positions[key] {
-                let existing = result[index]
-                let shouldReplace = (existing.seq == nil && message.seq != nil)
-                    || (existing.streaming && !message.streaming)
-                if shouldReplace { result[index] = message }
-                continue
-            }
-            positions[key] = result.count
-            result.append(message)
-        }
-        return result
     }
 
     private func startStream(_ id: String) {
@@ -443,6 +538,7 @@ final class WidgetModel: ObservableObject {
                 } catch {
                     if Task.isCancelled { return }
                     self?.streamFailures += 1
+                    WidgetLog.event("stream-retry", "failures=\(self?.streamFailures ?? -1)")
                     self?.setConnectionError(error)
                     if (self?.streamFailures ?? 0) >= 3 {
                         self?.restartConnection()
@@ -462,17 +558,29 @@ final class WidgetModel: ObservableObject {
 
     private func handle(_ event: WidgetEvent) {
         switch event {
-        case .snapshot(let snapshot, _):
+        case .snapshot(let snapshot, let hasMore):
             streamFailures = 0
             connection = .connected
             errorText = nil
-            // The snapshot only covers the event window; never let it erase a
-            // transcript already hydrated from /history.
-            if messages.isEmpty {
-                messages = deduplicated(snapshot)
+            // A reconnect snapshot is authoritative for the steps it carries.
+            // Merging it (instead of only seeding an empty transcript) is what
+            // restores a reply that finished while the stream was down.
+            let merged = Transcript.mergingSnapshot(into: messages, snapshot: snapshot)
+            if merged != messages {
+                messages = merged
+                cacheCurrentIfLoaded()
                 scrollTick += 1
             }
             streamingID = nil
+            WidgetLog.event(
+                "snapshot",
+                "in=\(snapshot.count) out=\(messages.count) hasMore=\(hasMore) running=\(isRunning)"
+            )
+            if !isRunning {
+                // Nothing is in flight, so a lingering streaming bubble means the
+                // end frame was lost. Settle and reconcile from /history.
+                settleTranscript(reason: "snapshot")
+            }
             if autoSyncAfterReconnect {
                 autoSyncAfterReconnect = false
                 if !isLoadingHistory {
@@ -499,9 +607,10 @@ final class WidgetModel: ObservableObject {
                 messages[index].streaming = false
             }
             messages.removeAll { $0.role == "assistant" && $0.text.isEmpty }
-            messages = deduplicated(messages)
+            messages = Transcript.deduped(messages)
             cacheCurrentIfLoaded()
             streamingID = nil
+            idleTicks = 0
             isRunning = false
         case .serverError(let message):
             errorText = message
@@ -527,7 +636,7 @@ final class WidgetModel: ObservableObject {
                 messages[index].seq = message.seq
                 messages[index].turn = message.turn
                 messages[index].step = message.step
-                messages = deduplicated(messages)
+                messages = Transcript.deduped(messages)
                 streamingID = nil
                 scrollTick += 1
                 return
@@ -545,7 +654,7 @@ final class WidgetModel: ObservableObject {
             return
         }
         messages.append(message)
-        messages = deduplicated(messages)
+        messages = Transcript.deduped(messages)
         cacheCurrentIfLoaded()
         scrollTick += 1
     }
@@ -619,27 +728,12 @@ final class WidgetModel: ObservableObject {
 
     @discardableResult
     private func mergeSynced(_ history: [ChatMessage]) -> Int {
-        guard !history.isEmpty else { return 0 }
-        let knownIDs = Set(messages.map(\.id))
-        let knownSeq = Set(messages.compactMap(\.seq))
-        let knownText = Set(messages.map { "\($0.role)|\($0.text)" })
-        var additions: [ChatMessage] = []
-        for message in history {
-            if !message.id.isEmpty && knownIDs.contains(message.id) { continue }
-            let key = "\(message.role)|\(message.text)"
-            if let seq = message.seq {
-                if knownSeq.contains(seq) { continue }
-            } else if knownText.contains(key) {
-                continue
-            }
-            additions.append(message)
-        }
-        guard !additions.isEmpty else { return 0 }
-        messages.append(contentsOf: additions)
-        messages = deduplicated(messages)
+        let result = Transcript.addingSynced(to: messages, history: history)
+        guard result.added > 0 else { return 0 }
+        messages = result.messages
         cacheCurrentIfLoaded()
         scrollTick += 1
-        return additions.count
+        return result.added
     }
 
     private func storeFullHistory(_ history: [ChatMessage], for id: String) {
@@ -732,7 +826,7 @@ final class WidgetModel: ObservableObject {
                 sessions = listed
                 loadWorkspaces()
                 selectedSessionID = id
-                UserDefaults.standard.set(id, forKey: selectedKey)
+                saveSelection(id)
                 messages = []
                 isLoadingHistory = true
                 startSession(id)
