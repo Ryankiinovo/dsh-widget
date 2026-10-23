@@ -1,5 +1,6 @@
 import SwiftUI
 import Foundation
+import AppKit
 
 /// Basic Markdown rendering for chat bubbles.
 ///
@@ -47,27 +48,7 @@ struct MarkdownMessageText: View {
             .padding(.leading, CGFloat(min(indent, 3)) * 10)
 
         case .code(let language, let value):
-            VStack(alignment: .leading, spacing: 4) {
-                if let language, !language.isEmpty {
-                    Text(language.uppercased())
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                }
-                Text(value.isEmpty ? " " : value)
-                    .font(.system(size: 11.5, design: .monospaced))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
-            .padding(8)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.black.opacity(0.16))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-            )
+            CodeBlockView(language: language, code: value, fillWidth: fillWidth)
 
         case .quote(let value):
             HStack(alignment: .top, spacing: 8) {
@@ -77,6 +58,29 @@ struct MarkdownMessageText: View {
                 InlineMarkdownText(text: value, size: 12.5)
                     .foregroundStyle(.secondary)
             }
+
+        case .table(let header, let rows):
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
+                GridRow {
+                    ForEach(Array(header.enumerated()), id: \.offset) { _, cell in
+                        InlineMarkdownText(text: cell, size: 12, weight: .semibold)
+                    }
+                }
+                Divider()
+                    .gridCellColumns(max(header.count, 1))
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    GridRow {
+                        ForEach(0..<max(header.count, 1), id: \.self) { column in
+                            InlineMarkdownText(
+                                text: column < row.count ? row[column] : "",
+                                size: 12
+                            )
+                        }
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+            .frame(maxWidth: 560, alignment: .leading)
 
         case .rule:
             Rectangle()
@@ -153,6 +157,7 @@ private enum MarkdownBlock {
     case code(String?, String)
     case quote(String)
     case rule
+    case table(header: [String], rows: [[String]])
 
     private static let fence = String(repeating: "\u{60}", count: 3)
 
@@ -218,6 +223,22 @@ private enum MarkdownBlock {
                 continue
             }
 
+            if let header = tableCells(trimmed),
+               index + 1 < lines.count,
+               isTableSeparator(lines[index + 1]) {
+                flushParagraph()
+                var rows: [[String]] = []
+                index += 2
+                while index < lines.count {
+                    let candidate = lines[index].trimmingCharacters(in: .whitespaces)
+                    guard !candidate.isEmpty, let cells = tableCells(candidate) else { break }
+                    rows.append(cells)
+                    index += 1
+                }
+                blocks.append(.table(header: header, rows: rows))
+                continue
+            }
+
             if let item = listItem(trimmed, raw: raw) {
                 flushParagraph()
                 blocks.append(.listItem(marker: item.0, text: item.1, indent: item.2))
@@ -246,6 +267,28 @@ private enum MarkdownBlock {
 
         flushParagraph()
         return blocks
+    }
+
+    /// Split a pipe-table row into cells. Leading/trailing pipes are optional.
+    private static func tableCells(_ line: String) -> [String]? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains("|") else { return nil }
+        var body = trimmed
+        if body.hasPrefix("|") { body.removeFirst() }
+        if body.hasSuffix("|") { body.removeLast() }
+        let cells = body
+            .split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        return cells.isEmpty ? nil : cells
+    }
+
+    /// A separator row is made of dashes, optionally with alignment colons.
+    private static func isTableSeparator(_ line: String) -> Bool {
+        guard let cells = tableCells(line), !cells.isEmpty else { return false }
+        return cells.allSatisfy { cell in
+            let core = cell.replacingOccurrences(of: ":", with: "")
+            return !core.isEmpty && core.allSatisfy { $0 == "-" }
+        }
     }
 
     private static func isRule(_ line: String) -> Bool {
@@ -284,3 +327,48 @@ private enum MarkdownBlock {
         return (String(first), value, indent)
     }
 }
+
+/// Fenced code block with a language tag and a one-tap copy button.
+private struct CodeBlockView: View {
+    let language: String?
+    let code: String
+    var fillWidth: Bool = true
+    @StateObject private var feedback = CopyFeedback()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                if let language, !language.isEmpty {
+                    Text(language.uppercased())
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 0)
+                Button {
+                    feedback.copy(code)
+                } label: {
+                    Image(systemName: feedback.copied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("复制代码")
+            }
+            Text(code.isEmpty ? " " : code)
+                .font(.system(size: 11.5, design: .monospaced))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: fillWidth ? .infinity : nil, alignment: .leading)
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.black.opacity(0.16))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+}
+

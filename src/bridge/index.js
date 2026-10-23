@@ -19,12 +19,17 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 
 const DEFAULT_DISCOVERY = join(homedir(), ".dsh", "widget-bridge.json");
 const DEFAULT_LIMIT = 500;
 const MAX_BODY_BYTES = 1024 * 1024;
+// A pasted screenshot is base64 inside the prompt body, so this route needs a
+// much larger ceiling than the control-plane routes.
+const MAX_PROMPT_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_PROMPT_IMAGES = 8;
 const HEARTBEAT_MS = 15000;
 // maxMessages counts event records, not chat messages. Ask DSH for both a
 // bounded event window and a minimum conversation window so opening a long
@@ -59,36 +64,107 @@ function statusFor(error) {
   return 500;
 }
 
+// Attachment ids are content-addressed; remember the media type reported with
+// each image block so /v1/attachments can answer with the right content type.
+const attachmentTypes = new Map();
+
+function partsOfContent(content) {
+  const result = { text: "", reasoning: "", attachments: [] };
+  if (typeof content === "string") {
+    result.text = content;
+    return result;
+  }
+  if (!Array.isArray(content)) return result;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    if (block.type === "text" && typeof block.text === "string") {
+      result.text += block.text;
+      continue;
+    }
+    if (block.type === "reasoning" && typeof block.text === "string") {
+      result.reasoning += block.text;
+      continue;
+    }
+    if (block.type === "image" && block.attachment) {
+      const a = block.attachment;
+      if (typeof a.attachmentId !== "string") continue;
+      if (typeof a.mediaType === "string") attachmentTypes.set(a.attachmentId, a.mediaType);
+      result.attachments.push({
+        attachmentId: a.attachmentId,
+        mediaType: typeof a.mediaType === "string" ? a.mediaType : null,
+        bytes: Number.isSafeInteger(a.bytes) ? a.bytes : null,
+        width: Number.isSafeInteger(a.width) ? a.width : null,
+        height: Number.isSafeInteger(a.height) ? a.height : null,
+        name: typeof a.name === "string" ? a.name : null,
+      });
+    }
+  }
+  return result;
+}
+
 function textOfContent(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((block) => block && block.type === "text" && typeof block.text === "string")
-    .map((block) => block.text)
-    .join("");
+  return partsOfContent(content).text;
+}
+
+/// One readable line for the status row: what this tool call is actually doing.
+/// run_code carries a human description, the others carry their main argument.
+function summarizeToolArguments(name, raw) {
+  let args = raw;
+  if (typeof raw === "string") {
+    try { args = JSON.parse(raw); } catch { args = null; }
+  }
+  const pick = (value) => (typeof value === "string" && value.trim() ? value : null);
+  let text = null;
+  if (args && typeof args === "object") {
+    const description = pick(args.description);
+    if (name === "run_code") {
+      text = description ?? pick(args.code);
+    } else if (name === "bash" || name === "shell") {
+      text = pick(args.command) ?? description;
+    } else if (name === "grep" || name === "rg") {
+      text = pick(args.pattern) ?? description;
+    } else if (name === "read" || name === "write" || name === "edit") {
+      text = pick(args.file_path) ?? pick(args.path) ?? description;
+    } else {
+      text = description
+        ?? pick(args.command)
+        ?? pick(args.pattern)
+        ?? pick(args.query)
+        ?? pick(args.file_path)
+        ?? pick(args.url);
+    }
+  }
+  if (!text && typeof raw === "string") text = raw;
+  if (!text) return "";
+  const flat = String(text).replace(/\s+/g, " ").trim();
+  // The App wraps the summary over as many lines as it needs, so keep more of
+  // the command here; only a whole file of code gets cut.
+  return flat.length > 300 ? flat.slice(0, 299) + "…" : flat;
 }
 
 function eventToMessage(event) {
   if (!event || typeof event !== "object") return null;
   if (event.type === "user/message") {
     if (event.data?.source?.kind !== "user") return null;
-    const text = textOfContent(event.data.content);
-    if (!text.trim()) return null;
+    const parts = partsOfContent(event.data.content);
+    if (!parts.text.trim() && parts.attachments.length === 0) return null;
     return {
       id: event.data.id ?? null,
       role: "user",
-      text,
+      text: parts.text,
+      attachments: parts.attachments,
       seq: event.seq,
       time: event.time,
     };
   }
   if (event.type === "assistant/message") {
-    const text = textOfContent(event.data?.message?.content);
-    if (!text.trim()) return null;
+    const parts = partsOfContent(event.data?.message?.content);
+    if (!parts.text.trim() && parts.attachments.length === 0) return null;
     return {
       id: event.data.message?.id ?? null,
       role: "assistant",
-      text,
+      text: parts.text,
+      attachments: parts.attachments,
       seq: event.seq,
       time: event.time,
       turn: event.data.turn,
@@ -191,6 +267,9 @@ export class WidgetBridge {
     this.logger = options.logger ?? console;
     this.controller = options.controller ?? null;
     this.registry = options.registry ?? null;
+    // Resolved lazily: the attachment service may register after the bridge
+    // starts, and the widget only needs it for image prompts.
+    this.resolveAttachments = options.resolveAttachments ?? null;
     this.server = null;
     this.started = false;
     this.stopping = false;
@@ -359,6 +438,41 @@ export class WidgetBridge {
     return mismatch === 0;
   }
 
+  /// Serve one content-addressed attachment from the DSH attachment store.
+  /// The id must be a literal sha256 reference; the resolved path is checked to
+  /// stay inside the store so it cannot be used to read arbitrary files.
+  async serveAttachment(res, rawId) {
+    let id = rawId;
+    try {
+      id = decodeURIComponent(rawId);
+    } catch {
+      // keep the raw value; validation below rejects it
+    }
+    const match = /^sha256:([0-9a-f]{64})$/u.exec(id);
+    if (!match) {
+      json(res, 400, { error: { code: "attachment/invalid", message: "bad attachment id" } });
+      return;
+    }
+    const hex = match[1];
+    const root = join(homedir(), ".dsh", "attachments", "v1", "objects");
+    const file = join(root, hex.slice(0, 2), hex);
+    if (!file.startsWith(root + sep)) {
+      json(res, 400, { error: { code: "attachment/invalid", message: "bad attachment path" } });
+      return;
+    }
+    try {
+      const data = await readFile(file);
+      res.writeHead(200, {
+        "content-type": attachmentTypes.get(id) ?? "application/octet-stream",
+        "content-length": data.length,
+        "cache-control": "private, max-age=86400",
+      });
+      res.end(data);
+    } catch {
+      json(res, 404, { error: { code: "attachment/not-found", message: "attachment missing" } });
+    }
+  }
+
   async handle(req, res) {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = url.pathname;
@@ -373,6 +487,11 @@ export class WidgetBridge {
     }
     if (!this.authorized(req)) {
       json(res, 401, { error: { code: "gateway/unauthorized", message: "widget token required" } });
+      return;
+    }
+
+    if (pathname.startsWith("/v1/attachments/") && req.method === "GET") {
+      await this.serveAttachment(res, pathname.slice("/v1/attachments/".length));
       return;
     }
 
@@ -480,12 +599,36 @@ export class WidgetBridge {
         return;
       }
       if (action === "prompt" && req.method === "POST") {
-        const body = await readBody(req);
+        const body = await readBody(req, MAX_PROMPT_BODY_BYTES);
         const text = typeof body.text === "string" ? body.text : "";
-        if (!text.trim()) {
-          const error = new Error("text is required");
+        const images = Array.isArray(body.images) ? body.images : [];
+        if (images.length > MAX_PROMPT_IMAGES) {
+          const error = new Error(`at most ${MAX_PROMPT_IMAGES} images per message`);
           error.code = "gateway/bad-request";
           throw error;
+        }
+        if (!text.trim() && images.length === 0) {
+          const error = new Error("text or images are required");
+          error.code = "gateway/bad-request";
+          throw error;
+        }
+        // DSH's own prompt admission normalizes encoded image parts, stores the
+        // bytes durably, and records the sha256 reference in the session log.
+        // Pre-admitting here would hand DSH already-resolved blocks, which its
+        // admission rejects (surfaced as session/agent-busy).
+        const content = [];
+        if (text.trim()) content.push({ type: "text", text });
+        for (const image of images) {
+          const data = typeof image?.data === "string" ? image.data : "";
+          const mediaType = typeof image?.mediaType === "string" ? image.mediaType : "";
+          if (!data || !/^image\/(png|jpeg|webp|gif)$/u.test(mediaType)) {
+            const error = new Error("each image needs base64 data and an image mediaType");
+            error.code = "gateway/bad-request";
+            throw error;
+          }
+          const part = { type: "image", data, mediaType };
+          if (typeof image.name === "string" && image.name.trim()) part.name = image.name.trim();
+          content.push(part);
         }
         // DSH's session controller requires a cancellation signal for prompt
         // admission and calls signal.throwIfAborted() before doing any work.
@@ -495,9 +638,18 @@ export class WidgetBridge {
         const result = await this.requireController().prompt({
           sessionId,
           mode: "queue",
-          content: [{ type: "text", text }],
+          content,
           requestId: randomUUID(),
-        }, admission.signal);
+        }, admission.signal).catch((error) => {
+          // DSH masks admission failures as session/agent-busy; keep the
+          // underlying reason in the bridge log for diagnosis.
+          this.logger.error(
+            "[dsh-widget-bridge] prompt rejected: " + String(error?.code ?? "") + " " +
+              String(error?.message ?? error) + " " +
+              JSON.stringify(error?.details ?? error?.data ?? null),
+          );
+          throw error;
+        });
         json(res, 200, { accepted: result?.accepted === true });
         return;
       }
@@ -671,8 +823,52 @@ export class WidgetBridge {
           continue;
         }
         if (item?.type === "event") {
-          const message = eventToMessage(item.event);
+          const event = item.event;
+          if (event?.type === "tool/call") {
+            await write("tool_call", {
+              turn: event.data?.turn,
+              step: event.data?.step,
+              callId: event.data?.callId,
+              name: event.data?.name,
+              detail: summarizeToolArguments(event.data?.name, event.data?.arguments),
+            });
+            continue;
+          }
+          if (event?.type === "tool/result") {
+            const text = textOfContent(event.data?.message?.content);
+            await write("tool_result", {
+              turn: event.data?.turn,
+              step: event.data?.step,
+              callId: event.data?.message?.toolCallId,
+              ok: event.data?.message?.isError !== true,
+              text: text.slice(0, 300),
+            });
+            continue;
+          }
+          if (event?.type === "turn/end") {
+            // The status row must stay for the whole turn, including the gaps
+            // between steps where no assistant stream is open.
+            await write("turn_end", {
+              turn: event.data?.turn,
+              reason: event.data?.reason?.kind ?? null,
+            });
+            continue;
+          }
+          const message = eventToMessage(event);
           if (message) await write("message", message);
+          // Committed assistant messages carry the step's full reasoning even
+          // when DSH does not stream reasoning-delta frames to this subscriber.
+          // Send it as a block so the widget tail still has text to show.
+          if (event.type === "assistant/message") {
+            const reasoning = partsOfContent(event.data?.message?.content).reasoning;
+            if (reasoning.trim()) {
+              await write("reasoning_block", {
+                turn: event.data?.turn ?? null,
+                step: event.data?.step ?? null,
+                text: reasoning,
+              });
+            }
+          }
           continue;
         }
         if (item?.type !== "assistant-stream") continue;
@@ -698,6 +894,14 @@ export class WidgetBridge {
         if (!chunk) continue;
         if (chunk.type === "text-delta" && typeof chunk.text === "string" && chunk.text) {
           await write("assistant_delta", {
+            attemptId: frame.attemptId,
+            turn: frame.turn,
+            step: frame.step,
+            index: chunk.index,
+            text: chunk.text,
+          });
+        } else if (chunk.type === "reasoning-delta" && typeof chunk.text === "string" && chunk.text) {
+          await write("reasoning_delta", {
             attemptId: frame.attemptId,
             turn: frame.turn,
             step: frame.step,

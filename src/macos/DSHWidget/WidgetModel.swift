@@ -20,12 +20,17 @@ final class WidgetModel: ObservableObject {
     @Published var sessions: [SessionSummary] = []
     @Published var workspaces: [WorkspaceSummary] = []
     @Published var messages: [ChatMessage] = []
+    /// Live status for the running turn: phase, clock, reasoning tail, steps.
+    @Published var activity = ThinkingActivity()
     @Published var isLoadingHistory = false
     @Published var isSyncingHistory = false
     @Published var syncStatus: String?
 
     var visibleMessages: [ChatMessage] {
-        var result = messages.filter { !$0.text.isEmpty || $0.pending }
+        // An image-only user turn has no text, so attachments count as content.
+        var result = messages.filter {
+            !$0.text.isEmpty || $0.pending || !$0.attachments.isEmpty || !$0.localImages.isEmpty
+        }
         if let last = messages.last,
            last.role == "assistant",
            last.streaming,
@@ -37,7 +42,13 @@ final class WidgetModel: ObservableObject {
     }
     @Published var selectedSessionID: String?
     @Published var input: String = ""
+    /// Images pasted into the composer, waiting for the next send.
+    @Published var composerImages: [ComposerImage] = []
+    static let maxComposerImages = 6
     @Published var isRunning: Bool = false
+    /// Sessions the event stream has seen start a turn. The list dot flips on
+    /// this immediately instead of waiting for the next /v1/sessions poll.
+    @Published private(set) var liveRunningIDs: Set<String> = []
     @Published var connection: Connection = .waiting
     @Published var errorText: String?
     @Published var scrollTick: Int = 0
@@ -48,6 +59,9 @@ final class WidgetModel: ObservableObject {
     private var connectTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var streamingID: String?
+    /// Last moment a stream frame touched the transcript. Reconcile uses it so a
+    /// one-second gap between two steps is not mistaken for a finished turn.
+    private var lastStreamAt = Date.distantPast
     private var streamFailures = 0
     private var reconcileTask: Task<Void, Never>?
     private var isTailSyncing = false
@@ -296,11 +310,25 @@ final class WidgetModel: ObservableObject {
         refreshTask?.cancel()
         refreshTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                let interval = self?.refreshInterval ?? 5_000_000_000
+                try? await Task.sleep(nanoseconds: interval)
                 if Task.isCancelled { return }
                 await self?.refreshSessions()
             }
         }
+    }
+
+    /// 5s while everything idles, 2s while a session is running. A short turn
+    /// can start and finish between two 10s polls, which made the dot miss it.
+    private var refreshInterval: UInt64 {
+        let busy = !liveRunningIDs.isEmpty || sessions.contains(where: { $0.running })
+        return busy ? 2_000_000_000 : 5_000_000_000
+    }
+
+    /// Running state for the session list: the bridge flag plus anything the
+    /// stream has seen start but not finish yet.
+    func isLiveRunning(_ session: SessionSummary) -> Bool {
+        session.running || liveRunningIDs.contains(session.id)
     }
 
     /// The event stream can die without `assistant_end` (idle timeout, sleep,
@@ -334,7 +362,11 @@ final class WidgetModel: ObservableObject {
             // can leave a spinner behind; give it one more tick, then settle.
             if idleTicks > 0 {
                 idleTicks += 1
-                if idleTicks >= 2 { settleTranscript(reason: "reconcile") }
+                // Only fill in what the stream missed. Settling here is what
+                // split a reply in two: the reply pauses between frames (long
+                // reasoning, a tool call), DSH reports idle meanwhile, and the
+                // settled bubble then sat next to the authoritative copy.
+                if idleTicks >= 2 { silentSyncHistory(reason: "reconcile-idle") }
             }
             return
         }
@@ -353,7 +385,7 @@ final class WidgetModel: ObservableObject {
             idleTicks += 1
             WidgetLog.event("reconcile", "idle=\(idleTicks) streaming=\(hasStreamingBubble)")
             if idleTicks >= 2 {
-                settleTranscript(reason: "reconcile")
+                silentSyncHistory(reason: "reconcile-idle")
             }
         } catch {
             // refreshSessions owns the offline transition.
@@ -363,11 +395,20 @@ final class WidgetModel: ObservableObject {
     /// Collapse the leftovers of an interrupted stream once the session is known
     /// to be idle, then pull whatever the event window missed.
     private func settleTranscript(reason: String) {
+        // DSH reports idle for a beat between two steps. Settling then turns the
+        // streaming bubble into a normal one and lets the tail sync append the
+        // authoritative reply next to it, which reads as a second bubble.
+        if hasStreamingBubble, Date().timeIntervalSince(lastStreamAt) < 2.5 {
+            WidgetLog.event("settle-skip", "reason=\(reason) quiet=\(Int(Date().timeIntervalSince(lastStreamAt) * 1000))ms")
+            return
+        }
+        if let id = selectedSessionID { liveRunningIDs.remove(id) }
         let before = messages.count
         let streamingBefore = hasStreamingBubble
         messages = Transcript.settling(messages)
         streamingID = nil
         idleTicks = 0
+        activity.finish(at: Date())
         cacheCurrentIfLoaded()
         let lastLength = messages.last(where: { $0.role == "assistant" })?.text.count ?? 0
         WidgetLog.event(
@@ -381,6 +422,13 @@ final class WidgetModel: ObservableObject {
     /// Fetch only messages newer than the newest sequence on screen, without
     /// touching the sync banner: this runs automatically after a reconnect.
     private func silentSyncHistory(reason: String) {
+        // A streaming bubble is authoritative for its step: merging a history
+        // copy into it mid-stream either duplicates the text (history first,
+        // deltas after) or closes the bubble early. Wait until the stream ends.
+        guard !hasStreamingBubble else {
+            WidgetLog.event("tail-sync-skip", "reason=\(reason) streaming=true")
+            return
+        }
         guard let client,
               let id = selectedSessionID,
               connection == .connected,
@@ -422,6 +470,9 @@ final class WidgetModel: ObservableObject {
             sessions = listed
             loadWorkspaces()
             connection = .connected
+            // Drop ids that no longer exist; live ids whose turn just ended are
+            // cleared by assistantEnd or by settleTranscript.
+            liveRunningIDs = liveRunningIDs.filter { id in listed.contains { $0.id == id } }
             if let selectedSessionID, let current = listed.first(where: { $0.id == selectedSessionID }) {
                 isRunning = current.running
             }
@@ -442,6 +493,7 @@ final class WidgetModel: ObservableObject {
         selectedSessionID = id
         saveSelection(id)
         messages = []
+        activity = ThinkingActivity()
         errorText = nil
         syncStatus = nil
         isSyncingHistory = false
@@ -590,19 +642,40 @@ final class WidgetModel: ObservableObject {
         case .message(let message):
             merge(message)
         case .assistantStart(let turn, let step):
+            if let id = selectedSessionID { liveRunningIDs.insert(id) }
             let id = UUID().uuidString
             streamingID = id
             messages.append(ChatMessage(id: id, role: "assistant", text: "", turn: turn, step: step, streaming: true))
+            WidgetLog.event("stream-start", "turn=\(turn ?? -1) step=\(step ?? -1) id=\(id.prefix(8))")
+            activity.begin(turn: turn, step: step, at: Date())
             cacheCurrentIfLoaded()
             scrollTick += 1
         case .assistantDelta(let text, let turn, let step):
+            activity.textStarted(step: step, at: Date())
             appendStreamText(text, turn: turn, step: step)
+        case .reasoningDelta(let text, _, let step):
+            activity.appendReasoning(text, step: step, at: Date())
+            scrollTick += 1
+        case .reasoningBlock(let text, _, let step):
+            activity.setReasoning(text, step: step, at: Date())
+            scrollTick += 1
+        case .toolCall(let name, let detail, _, let step):
+            activity.toolCall(name: name, detail: detail, at: Date())
+            if let step { activity.step = step }
+            scrollTick += 1
+        case .toolResult(let ok, let text, _, _):
+            activity.toolResult(ok: ok, text: text, at: Date())
+            scrollTick += 1
         case .assistantBlock(let text, let turn, let step):
-            if let index = streamIndex(turn: turn, step: step), messages[index].text.isEmpty {
+            let found = streamIndex(turn: turn, step: step)
+            WidgetLog.event("stream-block", "turn=\(turn ?? -1) step=\(step ?? -1) found=\(found != nil) chars=\(text.count) existing=\(found.map { messages[$0].text.count } ?? -1)")
+            if let index = found, messages[index].text.isEmpty {
                 messages[index].text = text
                 scrollTick += 1
             }
         case .assistantEnd:
+            WidgetLog.event("stream-end", "count=\(messages.count) streaming=\(streamingID?.prefix(8) ?? "nil")")
+            if let id = selectedSessionID { liveRunningIDs.remove(id) }
             if let streamingID, let index = messages.firstIndex(where: { $0.id == streamingID }) {
                 messages[index].streaming = false
             }
@@ -610,6 +683,8 @@ final class WidgetModel: ObservableObject {
             messages = Transcript.deduped(messages)
             cacheCurrentIfLoaded()
             streamingID = nil
+        case .turnEnd:
+            withAnimation(.easeOut(duration: 0.45)) { activity.finish(at: Date()) }
             idleTicks = 0
             isRunning = false
         case .serverError(let message):
@@ -629,13 +704,17 @@ final class WidgetModel: ObservableObject {
                     $0.role == "assistant" && $0.turn == message.turn && $0.step == message.step
                 })
             }
-            if let index {
-                messages[index].text = message.text
+            let resolved = index ?? Transcript.similarAssistantIndex(message, in: messages)
+            WidgetLog.event("merge-assistant", "turn=\(message.turn ?? -1) step=\(message.step ?? -1) found=\(index != nil) similar=\(resolved != nil) seq=\(message.seq ?? -1) chars=\(message.text.count)")
+            if let index = resolved {
+                if message.text.count >= messages[index].text.count {
+                    messages[index].text = message.text
+                }
                 messages[index].streaming = false
-                messages[index].id = message.id
-                messages[index].seq = message.seq
-                messages[index].turn = message.turn
-                messages[index].step = message.step
+                if !message.id.isEmpty { messages[index].id = message.id }
+                if message.seq != nil { messages[index].seq = message.seq }
+                if message.turn != nil { messages[index].turn = message.turn }
+                if message.step != nil { messages[index].step = message.step }
                 messages = Transcript.deduped(messages)
                 streamingID = nil
                 scrollTick += 1
@@ -647,6 +726,11 @@ final class WidgetModel: ObservableObject {
             messages[pendingIndex].pending = false
             messages[pendingIndex].id = message.id
             messages[pendingIndex].seq = message.seq
+            messages[pendingIndex].text = message.text
+            messages[pendingIndex].attachments = message.attachments
+            // The echoed message now carries attachment ids; drop the local
+            // previews so the shared attachment loader owns the pixels.
+            messages[pendingIndex].localImages = []
             scrollTick += 1
             return
         }
@@ -673,6 +757,7 @@ final class WidgetModel: ObservableObject {
 
     private func appendStreamText(_ text: String, turn: Int?, step: Int?) {
         guard !text.isEmpty else { return }
+        lastStreamAt = Date()
         if let index = streamIndex(turn: turn, step: step) {
             messages[index].text += text
             messages[index].streaming = true
@@ -763,19 +848,60 @@ final class WidgetModel: ObservableObject {
         }
     }
 
+    /// Encode pasted images and queue them as composer attachments.
+    func addPastedImages(_ items: [(image: NSImage, name: String?)]) {
+        guard !items.isEmpty else { return }
+        let room = max(0, Self.maxComposerImages - composerImages.count)
+        guard room > 0 else {
+            errorText = "一条消息最多 \(Self.maxComposerImages) 张图片"
+            return
+        }
+        var added: [ComposerImage] = []
+        for (offset, item) in items.prefix(room).enumerated() {
+            let fallback = "粘贴图片-\(composerImages.count + offset + 1)"
+            guard let encoded = ComposerImageEncoder.make(from: item.image, name: item.name ?? fallback) else {
+                continue
+            }
+            added.append(encoded)
+        }
+        guard !added.isEmpty else {
+            errorText = "这张图片读不出来"
+            return
+        }
+        errorText = nil
+        composerImages.append(contentsOf: added)
+    }
+
+    func removeComposerImage(_ id: UUID) {
+        composerImages.removeAll { $0.id == id }
+    }
+
     func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let id = selectedSessionID, let client else { return }
+        let images = composerImages
+        // An image alone is a valid turn.
+        guard !text.isEmpty || !images.isEmpty, let id = selectedSessionID, let client else { return }
         let pendingID = UUID().uuidString
         input = ""
+        composerImages = []
         errorText = nil
-        messages.append(ChatMessage(id: pendingID, role: "user", text: text, pending: true))
+        let previews = images.compactMap { $0.thumbnail }
+        messages.append(ChatMessage(
+            id: pendingID,
+            role: "user",
+            text: text.isEmpty ? "" : text,
+            pending: true,
+            localImages: previews
+        ))
         cacheCurrentIfLoaded()
         scrollTick += 1
         isRunning = true
+        let payload = images.map {
+            PromptImage(data: $0.data.base64EncodedString(), mediaType: $0.mediaType, name: $0.name)
+        }
         Task {
             do {
-                try await client.prompt(sessionId: id, text: text)
+                try await client.prompt(sessionId: id, text: text, images: payload)
                 await refreshSessions()
             } catch {
                 isRunning = false
@@ -784,6 +910,9 @@ final class WidgetModel: ObservableObject {
                 messages.removeAll { $0.id == pendingID }
                 if input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     input = text
+                }
+                if composerImages.isEmpty {
+                    composerImages = images
                 }
                 errorText = error.localizedDescription
                 scrollTick += 1

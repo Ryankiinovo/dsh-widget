@@ -19,8 +19,12 @@ run_unit() {
   local out=/tmp/dshwidget-transcript-tests
   swiftc -swift-version 5 -O \
     "$MACOS/DSHWidget/Models.swift" \
+    "$MACOS/DSHWidget/ImageStripLayout.swift" \
+    "$MACOS/DSHWidget/ThinkingActivity.swift" \
     "$MACOS/DSHWidget/Transcript.swift" \
+    "$MACOS/DSHWidget/ScrollFollow.swift" \
     "$MACOS/DSHWidget/ComposerKey.swift" \
+    "$MACOS/DSHWidget/ComposerDrop.swift" \
     "$MACOS/tests/main.swift" \
     -o "$out"
   "$out"

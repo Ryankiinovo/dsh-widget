@@ -23,6 +23,7 @@ const olderEvent = {
 };
 
 let lastCreateRequest = null;
+let lastPromptContent = null;
 const controller = {
   async list() {
     return {
@@ -39,7 +40,19 @@ const controller = {
   async prompt(request, signal) {
     assert.equal(request.sessionId, "session-abc");
     assert.equal(request.mode, "queue");
-    assert.equal(request.content[0].text, "测试");
+    // DSH admits images itself from encoded parts; an already-resolved
+    // attachment block makes its admission throw, which it reports as
+    // session/agent-busy.
+    for (const part of request.content) {
+      if (part.type === "image" && (typeof part.data !== "string" || part.attachment !== undefined)) {
+        const error = new Error("prompt rejected");
+        error.code = "session/agent-busy";
+        throw error;
+      }
+    }
+    lastPromptContent = request.content;
+    const textPart = request.content.find((part) => part.type === "text");
+    if (textPart) assert.equal(textPart.text, "测试");
     // DSH calls signal.throwIfAborted() at prompt admission; a missing signal
     // used to surface as a 500 gateway/internal error.
     assert.equal(typeof signal?.throwIfAborted, "function");
@@ -71,8 +84,14 @@ const controller = {
     assert.deepEqual(request.turnWindow, { minMessages: 20, minTurns: 2 });
     yield { type: "snapshot", records: events, hasMore: false, cursor: 2 };
     yield { type: "assistant-stream", frame: { type: "start", attemptId: "a1", turn: 1, step: 1, revision: 1 } };
+    yield { type: "assistant-stream", frame: { type: "chunk", attemptId: "a1", turn: 1, step: 1, revision: 2, index: 0, chunk: { type: "reasoning-delta", index: 0, text: "先想想" } } };
     yield { type: "assistant-stream", frame: { type: "chunk", attemptId: "a1", turn: 1, step: 1, revision: 2, index: 0, chunk: { type: "text-delta", index: 0, text: "流式" } } };
+    yield { type: "event", event: { type: "tool/call", seq: 91, data: { turn: 1, step: 1, callId: "c1", name: "run_code", arguments: "{\"code\":\"console.log(1)\",\"description\":\"读 handoff 文档\"}" } } };
+    yield { type: "event", event: { type: "tool/result", seq: 92, data: { turn: 1, step: 1, message: { role: "tool", toolCallId: "c1", content: [{ type: "text", text: "exit 0" }], isError: false } } } };
     yield { type: "assistant-stream", frame: { type: "end", attemptId: "a1", outcome: { kind: "committed" } } };
+    // Committed messages carry reasoning even when no reasoning frame streams.
+    yield { type: "event", event: { type: "assistant/message", seq: 93, data: { turn: 1, step: 1, message: { id: "m1", content: [{ type: "reasoning", text: "已提交的思考" }, { type: "text", text: "流式" }] } } } };
+    yield { type: "event", event: { type: "turn/end", seq: 94, data: { turn: 1, reason: { kind: "completed" } } } };
   },
 };
 
@@ -215,6 +234,26 @@ try {
     body: JSON.stringify({ text: "测试" }),
   });
   assert.equal(prompt.status, 200);
+  assert.deepEqual(lastPromptContent, [{ type: "text", text: "测试" }]);
+
+  // A pasted image travels as canonical base64 and must reach the controller
+  // as an encoded image part. DSH admits (stores + hashes) it itself; the
+  // bridge must never pre-resolve it into a durable reference.
+  const imagePrompt = await postJson("/v1/sessions/session-abc/prompt", {
+    text: "测试",
+    images: [{ data: "aGVsbG8=", mediaType: "image/png", name: "shot.png" }],
+  });
+  assert.equal(imagePrompt.status, 200);
+  assert.equal(lastPromptContent.length, 2);
+  assert.deepEqual(lastPromptContent[1], {
+    type: "image",
+    data: "aGVsbG8=",
+    mediaType: "image/png",
+    name: "shot.png",
+  });
+
+  const emptyPrompt = await postJson("/v1/sessions/session-abc/prompt", { text: "  " });
+  assert.equal(emptyPrompt.status, 400);
 
   const abort = new AbortController();
   const stream = await fetch("http://127.0.0.1:" + discovery.port + "/v1/sessions/session-abc/events", { headers, signal: abort.signal });
@@ -222,7 +261,7 @@ try {
   const decoder = new TextDecoder();
   let text = "";
   const deadline = Date.now() + 3000;
-  while (Date.now() < deadline && !text.includes("event: assistant_end")) {
+  while (Date.now() < deadline && !text.includes("event: turn_end")) {
     const { value, done } = await reader.read();
     if (done) break;
     text += decoder.decode(value, { stream: true });
@@ -230,7 +269,18 @@ try {
   abort.abort();
   assert.match(text, /event: snapshot/);
   assert.match(text, /event: assistant_delta/);
+  assert.match(text, /event: reasoning_delta/);
+  assert.match(text, /event: reasoning_block/);
+  assert.match(text, /"text":"已提交的思考"/);
+  assert.match(text, /"text":"先想想"/);
+  assert.match(text, /event: tool_call/);
+  assert.match(text, /"name":"run_code"/);
+  assert.match(text, /"detail":"读 handoff 文档"/);
+  assert.match(text, /event: tool_result/);
+  assert.match(text, /"ok":true/);
   assert.match(text, /event: assistant_end/);
+  assert.match(text, /event: turn_end/);
+  assert.match(text, /"reason":"completed"/);
   console.log("bridge http test passed");
 } finally {
   await bridge.stop();

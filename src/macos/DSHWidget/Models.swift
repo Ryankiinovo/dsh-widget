@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 struct DiscoveryInfo: Decodable {
@@ -33,32 +34,51 @@ struct SessionSummary: Identifiable, Decodable, Equatable {
     }
 }
 
+struct MessageAttachment: Decodable, Equatable, Identifiable {
+    let attachmentId: String
+    let mediaType: String?
+    let bytes: Int?
+    let width: Int?
+    let height: Int?
+    let name: String?
+
+    var id: String { attachmentId }
+}
+
 struct ChatMessage: Identifiable, Decodable, Equatable {
     var id: String
     var role: String
     var text: String
+    var attachments: [MessageAttachment] = []
     var seq: Int?
     var time: Double?
     var turn: Int?
     var step: Int?
     var streaming: Bool = false
     var pending: Bool = false
+    /// Local previews for a message this app just sent; the echoed copy from
+    /// DSH arrives with attachment ids instead.
+    var localImages: [NSImage] = []
 
     enum CodingKeys: String, CodingKey {
-        case id, role, text, seq, time, turn, step
+        case id, role, text, attachments, seq, time, turn, step
     }
 
-    init(id: String, role: String, text: String, seq: Int? = nil, time: Double? = nil,
-         turn: Int? = nil, step: Int? = nil, streaming: Bool = false, pending: Bool = false) {
+    init(id: String, role: String, text: String, attachments: [MessageAttachment] = [],
+         seq: Int? = nil, time: Double? = nil,
+         turn: Int? = nil, step: Int? = nil, streaming: Bool = false, pending: Bool = false,
+         localImages: [NSImage] = []) {
         self.id = id
         self.role = role
         self.text = text
+        self.attachments = attachments
         self.seq = seq
         self.time = time
         self.turn = turn
         self.step = step
         self.streaming = streaming
         self.pending = pending
+        self.localImages = localImages
     }
 
     init(from decoder: Decoder) throws {
@@ -66,12 +86,14 @@ struct ChatMessage: Identifiable, Decodable, Equatable {
         id = try container.decodeIfPresent(String.self, forKey: .id) ?? UUID().uuidString
         role = try container.decodeIfPresent(String.self, forKey: .role) ?? "assistant"
         text = try container.decodeIfPresent(String.self, forKey: .text) ?? ""
+        attachments = try container.decodeIfPresent([MessageAttachment].self, forKey: .attachments) ?? []
         seq = try container.decodeIfPresent(Int.self, forKey: .seq)
         time = try container.decodeIfPresent(Double.self, forKey: .time)
         turn = try container.decodeIfPresent(Int.self, forKey: .turn)
         step = try container.decodeIfPresent(Int.self, forKey: .step)
         streaming = false
         pending = false
+        localImages = []
     }
 }
 
@@ -141,6 +163,28 @@ struct StreamTextPayload: Decodable {
     let step: Int?
 }
 
+struct TurnEndPayload: Decodable {
+    let turn: Int?
+    let reason: String?
+}
+
+struct ToolCallPayload: Decodable {
+    let name: String
+    let callId: String?
+    /// One-line summary of the arguments, built by the bridge: what the call
+    /// is doing (a description for run_code, the command for bash, …).
+    let detail: String?
+    let turn: Int?
+    let step: Int?
+}
+
+struct StreamToolResultPayload: Decodable {
+    let ok: Bool?
+    let text: String?
+    let turn: Int?
+    let step: Int?
+}
+
 struct ErrorInfo: Decodable {
     let code: String
     let message: String
@@ -156,7 +200,12 @@ enum WidgetEvent {
     case assistantStart(turn: Int?, step: Int?)
     case assistantDelta(text: String, turn: Int?, step: Int?)
     case assistantBlock(text: String, turn: Int?, step: Int?)
+    case reasoningDelta(text: String, turn: Int?, step: Int?)
+    case reasoningBlock(text: String, turn: Int?, step: Int?)
+    case toolCall(name: String, detail: String, turn: Int?, step: Int?)
+    case toolResult(ok: Bool, text: String, turn: Int?, step: Int?)
     case assistantEnd
+    case turnEnd(turn: Int?, reason: String?)
     case serverError(String)
 }
 

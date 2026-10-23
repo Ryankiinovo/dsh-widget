@@ -20,6 +20,14 @@ enum BridgeError: LocalizedError {
     }
 }
 
+/// One pasted image, already encoded as canonical base64 for DSH's attachment
+/// admission. The widget never writes attachment objects itself.
+struct PromptImage {
+    let data: String
+    let mediaType: String
+    let name: String
+}
+
 final class BridgeClient {
     let baseURL: URL
     let token: String
@@ -94,10 +102,16 @@ final class BridgeClient {
         return try await perform(request, as: HistoryResponse.self)
     }
 
-    func prompt(sessionId: String, text: String) async throws {
+    func prompt(sessionId: String, text: String, images: [PromptImage] = []) async throws {
         struct Ack: Decodable { let accepted: Bool }
+        var json: [String: Any] = ["text": text]
+        if !images.isEmpty {
+            json["images"] = images.map {
+                ["data": $0.data, "mediaType": $0.mediaType, "name": $0.name]
+            }
+        }
         let ack = try await perform(
-            request(url: sessionURL(sessionId, "prompt"), method: "POST", json: ["text": text]),
+            request(url: sessionURL(sessionId, "prompt"), method: "POST", json: json),
             as: Ack.self
         )
         guard ack.accepted else { throw BridgeError.rejected }
@@ -160,8 +174,28 @@ final class BridgeClient {
         case "assistant_block":
             guard let payload = try? decoder.decode(StreamTextPayload.self, from: bytes) else { return nil }
             return .assistantBlock(text: payload.text, turn: payload.turn, step: payload.step)
+        case "reasoning_delta":
+            guard let payload = try? decoder.decode(StreamTextPayload.self, from: bytes) else { return nil }
+            return .reasoningDelta(text: payload.text, turn: payload.turn, step: payload.step)
+        case "reasoning_block":
+            guard let payload = try? decoder.decode(StreamTextPayload.self, from: bytes) else { return nil }
+            return .reasoningBlock(text: payload.text, turn: payload.turn, step: payload.step)
+        case "tool_call":
+            guard let payload = try? decoder.decode(ToolCallPayload.self, from: bytes) else { return nil }
+            return .toolCall(name: payload.name, detail: payload.detail ?? "", turn: payload.turn, step: payload.step)
+        case "tool_result":
+            let payload = try? decoder.decode(StreamToolResultPayload.self, from: bytes)
+            return .toolResult(
+                ok: payload?.ok ?? true,
+                text: payload?.text ?? "",
+                turn: payload?.turn,
+                step: payload?.step
+            )
         case "assistant_end":
             return .assistantEnd
+        case "turn_end":
+            let payload = try? decoder.decode(TurnEndPayload.self, from: bytes)
+            return .turnEnd(turn: payload?.turn, reason: payload?.reason)
         case "error":
             let payload = try? decoder.decode(ErrorPayload.self, from: bytes)
             return .serverError(payload?.error.message ?? "DSH 流错误")

@@ -18,14 +18,21 @@ swiftc \
   -framework SwiftUI \
   -framework AppKit \
   "$ROOT/DSHWidget/Models.swift" \
+  "$ROOT/DSHWidget/ImageStripLayout.swift" \
+  "$ROOT/DSHWidget/ThinkingActivity.swift" \
+  "$ROOT/DSHWidget/ThinkingViews.swift" \
   "$ROOT/DSHWidget/WidgetLog.swift" \
   "$ROOT/DSHWidget/Transcript.swift" \
+  "$ROOT/DSHWidget/ScrollFollow.swift" \
+  "$ROOT/DSHWidget/ViewInteraction.swift" \
   "$ROOT/DSHWidget/BridgeClient.swift" \
   "$ROOT/DSHWidget/WidgetModel.swift" \
   "$ROOT/DSHWidget/MarkdownText.swift" \
   "$ROOT/DSHWidget/ContentView.swift" \
   "$ROOT/DSHWidget/ComposerKey.swift" \
   "$ROOT/DSHWidget/ComposerKeys.swift" \
+  "$ROOT/DSHWidget/ComposerDrop.swift" \
+  "$ROOT/DSHWidget/ComposerPaste.swift" \
   "$ROOT/DSHWidget/ComposerEditor.swift" \
   "$ROOT/DSHWidget/DSHWidgetApp.swift" \
   -o "$APP/Contents/MacOS/DSHWidget"

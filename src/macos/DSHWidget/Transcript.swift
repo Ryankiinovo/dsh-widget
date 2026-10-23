@@ -100,17 +100,48 @@ enum Transcript {
            let index = list.firstIndex(where: { $0.role == message.role && $0.seq == seq }) {
             return index
         }
+        // A history reply carries turn/step while the streaming bubble it should
+        // fold into may not (delta frames have neither), so fall through to text
+        // similarity instead of giving up when the step lookup misses.
         if message.role == "assistant", message.turn != nil || message.step != nil {
-            return list.firstIndex(where: {
+            if let index = list.firstIndex(where: {
                 $0.role == "assistant" && $0.turn == message.turn && $0.step == message.step
-            })
+            }) { return index }
         }
         if message.role == "user" {
             return list.lastIndex(where: {
                 $0.role == "user" && $0.pending && $0.text == message.text
             })
         }
+        if message.role == "assistant" {
+            return similarAssistantIndex(message, in: list)
+        }
         return nil
+    }
+
+    /// One reply can reach the widget twice with no shared turn/step or id:
+    /// /history and the live stream label the same step differently, and a
+    /// reconnect can replay it. Fall back to text similarity so a single answer
+    /// never splits into two bubbles with a duplicated paragraph.
+    static func similarAssistantIndex(_ message: ChatMessage, in list: [ChatMessage]) -> Int? {
+        guard message.role == "assistant" else { return nil }
+        let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.count >= 40 else { return nil }
+        return list.lastIndex { candidate in
+            guard candidate.role == "assistant" else { return false }
+            let other = candidate.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard other.count >= 40 else { return false }
+            if other == text { return true }
+            let shorter = other.count <= text.count ? other : text
+            let longer = other.count <= text.count ? text : other
+            guard longer.contains(shorter) else { return false }
+            if Double(shorter.count) / Double(longer.count) > 0.8 { return true }
+            // A stream that attached late only carries the tail of the reply:
+            // the partial bubble is a suffix of the authoritative text. Merge
+            // those as well, otherwise the tail stays behind as a second
+            // bubble after the full reply arrives from /history.
+            return shorter.count >= 40 && longer.hasSuffix(shorter)
+        }
     }
 
     /// Merge one authoritative message into an existing bubble. Returns whether
