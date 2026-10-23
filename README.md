@@ -11,7 +11,7 @@ A macOS desktop widget for the DeepSeek Harness desktop app: keep the current se
 
 ![status](https://img.shields.io/badge/status-early%20preview-orange)
 
-**Latest release:** [v0.1.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.1.0)
+**Latest release:** [v0.2.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.2.0)
 
 ## What it does
 
@@ -21,6 +21,8 @@ A macOS desktop widget for the DeepSeek Harness desktop app: keep the current se
 - Loads full session history (paged) and keeps a local cache; a sync button fills gaps after disconnects.
 - Supports basic Markdown: paragraphs, headings, lists, quotes, rules, code blocks, bold/italic/inline code and links.
 - Shows a workspace menu and can create a new session in the current workspace.
+- While the agent runs, a status row stays at the end of the session: breathing lamp (green = thinking/writing, blue = running a tool, yellow = waiting or error), action name, elapsed timer, step number, a tick strip, the last three reasoning segments, and a trace of the last three tool calls.
+- Images inside messages render as a thumbnail strip (56pt, up to 9 per row, then +N); click to open the viewer and flip with ←/→, close with Esc. Paste or drag image files into the composer.
 
 ## Requirements
 
