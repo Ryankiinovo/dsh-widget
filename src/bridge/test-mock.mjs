@@ -321,6 +321,17 @@ try {
   const ticket = await pairStart.json();
   assert.match(ticket.code, /^[0-9]{6}$/u);
   assert.ok(Date.parse(ticket.expiresAt) > Date.now());
+  // The QR payload has to be self-contained: the phone gets scheme, base URL
+  // and code from one scan, plus the other reachable base URLs for later.
+  assert.match(ticket.uri, /^dshwidget:\/\/pair\?/u);
+  const qr = new URLSearchParams(ticket.uri.slice("dshwidget://pair?".length));
+  assert.equal(qr.get("v"), "1");
+  assert.ok((qr.get("u") ?? "").startsWith("http"));
+  assert.equal(qr.get("c"), ticket.code);
+  assert.ok(Array.isArray(ticket.addrs) && ticket.addrs.length >= 1);
+  assert.equal(ticket.addrs[0], qr.get("u"));
+  assert.ok(ticket.addrs.every((u) => u.startsWith("http")));
+  if (ticket.addrs.length > 1) assert.equal(qr.get("a"), ticket.addrs.join(","));
 
   const wrongCode = ticket.code === "000000" ? "111111" : "000000";
   const claimWrong = await postJson("/v1/pair/claim", { code: wrongCode, name: "iPhone" });

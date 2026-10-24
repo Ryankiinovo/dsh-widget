@@ -26,6 +26,7 @@ swiftc \
   "$ROOT/DSHWidget/ScrollFollow.swift" \
   "$ROOT/DSHWidget/ViewInteraction.swift" \
   "$ROOT/DSHWidget/BridgeClient.swift" \
+  "$ROOT/DSHWidget/PairingView.swift" \
   "$ROOT/DSHWidget/WidgetModel.swift" \
   "$ROOT/DSHWidget/MarkdownText.swift" \
   "$ROOT/DSHWidget/ContentView.swift" \

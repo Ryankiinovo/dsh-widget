@@ -11,7 +11,7 @@ A macOS desktop widget for the DeepSeek Harness desktop app: keep the current se
 
 ![status](https://img.shields.io/badge/status-early%20preview-orange)
 
-**Latest release:** [v0.3.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.3.0)
+**Latest release:** [v0.4.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.4.0)
 
 ## What it does
 
@@ -23,6 +23,8 @@ A macOS desktop widget for the DeepSeek Harness desktop app: keep the current se
 - Shows a workspace menu and can create a new session in the current workspace.
 - While the agent runs, a status row stays at the end of the session: breathing lamp (green = thinking/writing, blue = running a tool, yellow = waiting or error), action name, elapsed timer, step number, a tick strip, the last three reasoning segments, and a trace of the last three tool calls.
 - Images inside messages render as a thumbnail strip (56pt, up to 9 per row, then +N); click to open the viewer and flip with ←/→, close with Esc. Paste or drag image files into the composer.
+- Phone pairing: the QR button in the header opens a card (white-background QR, six-digit code, countdown, candidate addresses); the mobile client pairs by scanning. Paired device tokens can be revoked individually.
+- Optional remote access: `src/scripts/tunnel.sh` starts a Cloudflare quick tunnel and writes the address to `~/.dsh/widget-public-url`; `install-launchd.sh` installs it as a user-level launchd service (starts at login, restarts on crash, survives DSH quitting). `GET /v1/endpoints` lets the client refresh candidate addresses, so a new tunnel hostname no longer requires re-pairing.
 
 ## Requirements
 
@@ -134,6 +136,7 @@ The bridge does not duplicate DSH business logic; it exposes existing session ca
 - Desktop window level: full-screen apps cover the widget by design.
 - No protocol version negotiation; a future DSH release may change the plugin API.
 - Full history is capped at 200 pages; the UI reports when more remains.
+- Cloudflare quick tunnels buffer `text/event-stream` bodies for roughly 40–50 seconds. On cellular the client falls back to polling: history and prompts work, but the live "thinking" status row does not. For reliable streaming, use a self-hosted tunnel (frp + Caddy or a Cloudflare named tunnel).
 
 ## License
 

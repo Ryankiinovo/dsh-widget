@@ -296,7 +296,7 @@ final class WidgetModel: ObservableObject {
                     startReconcile()
                     return
                 } catch {
-                    WidgetLog.event("connect-failed", "error=\((error as NSError).code)")
+                    WidgetLog.event("connect-failed", "error=\((error as NSError).code) base=\(candidate.baseURL.absoluteString) desc=\(error.localizedDescription)")
                     connection = .offline
                 }
             } else {
@@ -461,6 +461,30 @@ final class WidgetModel: ObservableObject {
     private func saveSelection(_ id: String) {
         guard !isTestRun else { return }
         UserDefaults.standard.set(id, forKey: selectedKey)
+    }
+
+    /// Opens a pairing window through the live bridge connection. The ticket
+    /// carries the QR payload; the overlay renders it and shows the fallback code.
+    func startPairing() async throws -> PairingTicket {
+        // First click can land before connectLoop finishes; a short wait beats
+        // showing "invalid response" for something that is merely not ready.
+        var client = self.client
+        for _ in 0..<15 where client == nil {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            client = self.client
+        }
+        guard let client else {
+            WidgetLog.event("pair-start", "client=nil after wait")
+            throw BridgeError.invalidResponse
+        }
+        do {
+            let ticket = try await client.startPairing()
+            WidgetLog.event("pair-start", "ok=1 addrs=\(ticket.addrs.count)")
+            return ticket
+        } catch {
+            WidgetLog.event("pair-start", "failed desc=\(error.localizedDescription)")
+            throw error
+        }
     }
 
     func refreshSessions() async {

@@ -80,6 +80,15 @@ final class BridgeClient {
         }
     }
 
+    /// Opens a 6-digit pairing window. The ticket also carries the QR payload,
+    /// so a phone gets scheme, base URL and code from a single scan.
+    func startPairing() async throws -> PairingTicket {
+        try await perform(
+            request(path: "v1/pair/start", method: "POST", json: ["label": "DSH 小组件"]),
+            as: PairingTicket.self
+        )
+    }
+
     func listSessions() async throws -> [SessionSummary] {
         let response = try await perform(request(path: "v1/sessions"), as: SessionsResponse.self)
         return response.sessions

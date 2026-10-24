@@ -227,3 +227,22 @@ enum Discovery {
         return info
     }
 }
+/// One pairing window: what a phone scans (uri), what a person can type
+/// instead (code), and every base URL this host answers on right now.
+struct PairingTicket: Decodable, Equatable {
+    let code: String
+    let expiresAt: String
+    let ttlMs: Int?
+    let addrs: [String]
+    let uri: String
+
+    /// A phone leaves the LAN mid-story, so a ticket can carry more than one
+    /// base URL; a blank list would mean the bridge is unreachable.
+    var usableAddrs: [String] { addrs.filter { !$0.isEmpty } }
+
+    var expiry: Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: expiresAt) ?? ISO8601DateFormatter().date(from: expiresAt)
+    }
+}

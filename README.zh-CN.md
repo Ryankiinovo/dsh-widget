@@ -7,7 +7,7 @@
 > 非官方社区项目，与 DeepSeek 无隶属关系。
 > 早期版本：**Apple Silicon / macOS 14+**，ad-hoc 签名，**未公证**。
 
-**最新版本：** [v0.3.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.3.0)
+**最新版本：** [v0.4.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.4.0)
 
 ## 功能
 
@@ -19,6 +19,8 @@
 - 提供工作区菜单，可在当前工作区新建会话。
 - Agent 运行时在会话末尾常驻一条状态行：呼吸灯（绿＝思考/生成回答，蓝＝运行工具，黄＝等待或出错）、动作名、已用计时、第 N 步、秒格条、最近 3 段思考，以及最近 3 个工具调用的流水。
 - 消息里的图片以缩略条显示（56pt、一行最多 9 格、超出显示 +N），点击打开查看器、←/→ 翻页、Esc 关闭；输入框支持粘贴与拖放图片文件。
+- 手机配对：header 的二维码按钮弹出卡片（白底二维码 + 6 位配对码 + 倒计时 + 候选地址），移动端扫码即配对；配对后设备 token 可单独吊销。
+- 可选远程访问：`src/scripts/tunnel.sh` 起 Cloudflare quick tunnel 并把地址写入 `~/.dsh/widget-public-url`，`install-launchd.sh` 把它装成用户级常驻服务（登录自启、挂了自动拉起、不受 DSH 退出影响）；`GET /v1/endpoints` 让客户端自动刷新候选地址，隧道换域名不必重扫配对码。
 
 ## 环境要求
 
@@ -130,6 +132,7 @@ DSH Host
 - 小组件位于桌面层级，全屏应用会遮住它，这是设计行为。
 - 没有协议版本协商；未来 DSH 版本可能修改插件 API。
 - 完整历史最多 200 页；超过上限时 UI 会提示还有更早记录。
+- Cloudflare quick tunnel 会把 `text/event-stream` 响应体缓冲约 40–50 秒，蜂窝网络下客户端会降级为轮询：能读能发，但没有实时的「思考中」状态行。需要稳定流式请用自建隧道（frp + Caddy 或 Cloudflare named tunnel）。
 
 ## 许可证
 

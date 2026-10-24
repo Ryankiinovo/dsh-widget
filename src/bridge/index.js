@@ -20,7 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, networkInterfaces } from "node:os";
 import { basename, dirname, join, sep } from "node:path";
 import {
   AuditLog,
@@ -34,6 +34,10 @@ import {
 const DEFAULT_DISCOVERY = join(homedir(), ".dsh", "widget-bridge.json");
 const DEFAULT_DEVICES = join(homedir(), ".dsh", "widget-devices.json");
 const DEFAULT_AUDIT = join(homedir(), ".dsh", "widget-audit.log");
+// A tunnel URL changes every time the tunnel is re-created, so it cannot live in
+// the launch config — that would mean restarting DSH after every reconnect. The
+// bridge reads this file per request; `src/scripts/tunnel.sh` is its only writer.
+const DEFAULT_PUBLIC_URL_FILE = join(homedir(), ".dsh", "widget-public-url");
 const DEFAULT_LIMIT = 500;
 const MAX_BODY_BYTES = 1024 * 1024;
 // A pasted screenshot is base64 inside the prompt body, so this route needs a
@@ -227,6 +231,9 @@ function eventToMessage(event) {
       id: event.data.message?.id ?? null,
       role: "assistant",
       text: parts.text,
+      // Committed messages keep the step's whole reasoning; the client shows
+      // it above the bubble, so history-only turns read like live ones.
+      reasoning: parts.reasoning,
       attachments: parts.attachments,
       seq: event.seq,
       time: event.time,
@@ -333,6 +340,40 @@ function parseAfterSeq(value) {
   return parsed;
 }
 
+/** Current tunnel URL left on disk by `tunnel.sh`, if any. */
+function runtimePublicUrl(path) {
+  try {
+    const raw = readFileSync(path, "utf8").trim();
+    return raw.length ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+/** LAN IPv4 candidates a phone could dial, in interface order. */
+function lanAddresses(port) {
+  const urls = [];
+  for (const list of Object.values(networkInterfaces())) {
+    for (const net of list ?? []) {
+      if (net.family !== "IPv4" || net.internal) continue;
+      if (net.address.startsWith("169.254.")) continue;
+      urls.push("http://" + net.address + ":" + String(port));
+    }
+  }
+  return urls;
+}
+
+/**
+ * Payload for the QR code the desktop widget shows. A custom scheme keeps the
+ * code useless to random QR scanners; the phone app parses it and pre-fills
+ * both the base URL and the pairing code.
+ */
+function pairingURI(base, code, addrs) {
+  const params = new URLSearchParams({ v: "1", u: base, c: code });
+  if (addrs.length > 1) params.set("a", addrs.join(","));
+  return "dshwidget://pair?" + params.toString();
+}
+
 export class WidgetBridge {
   constructor(options = {}) {
     this.host = options.host ?? "127.0.0.1";
@@ -348,6 +389,9 @@ export class WidgetBridge {
     // Loopback mode can rely on the host token alone. Once the bridge is
     // reachable from the network, each client needs its own revocable
     // credential, so pairing and per-device tokens are always available.
+    this.publicUrl =
+      options.publicUrl ?? process.env.DSH_BRIDGE_PUBLIC_URL ?? null;
+    this.publicUrlFile = options.publicUrlFile ?? DEFAULT_PUBLIC_URL_FILE;
     this.publicMode =
       options.publicMode ??
       (this.host !== "127.0.0.1" && this.host !== "localhost" && this.host !== "::1");
@@ -370,6 +414,9 @@ export class WidgetBridge {
     this.started = false;
     this.stopping = false;
     this.activeStreams = new Set();
+    // sessionId → 这一轮正在产生的思考。DSH 只把 reasoning-delta 推给当时的
+    // 订阅者，手机切后台/退会话错过就再也拿不回来；重连时先回放这一段。
+    this.liveReasoning = new Map();
     this.server = createServer((req, res) => {
       void this.handle(req, res).catch((error) => {
         try {
@@ -382,6 +429,55 @@ export class WidgetBridge {
   attach(controller, registry = null) {
     this.controller = controller;
     this.registry = registry;
+  }
+
+  /** 新一轮开始：换 turn/step/attempt 就重置缓冲，同一轮内重复收到 start 不重置。 */
+  beginLiveReasoning(sessionId, turn, step, attemptId) {
+    const key = String(sessionId);
+    const current = this.liveReasoning.get(key);
+    if (
+      current &&
+      current.turn === (turn ?? null) &&
+      current.step === (step ?? null) &&
+      current.attemptId === (attemptId ?? null)
+    ) {
+      return;
+    }
+    this.liveReasoning.set(key, {
+      turn: turn ?? null,
+      step: step ?? null,
+      attemptId: attemptId ?? null,
+      text: "",
+      startedAt: Date.now(),
+      seen: new Set(),
+    });
+  }
+
+  /** 逐帧累积。同一会话可能有多个订阅者，靠 attemptId + index 去重。 */
+  appendLiveReasoning(sessionId, frame, chunk) {
+    const key = String(sessionId);
+    let live = this.liveReasoning.get(key);
+    if (
+      !live ||
+      live.turn !== (frame.turn ?? null) ||
+      live.step !== (frame.step ?? null)
+    ) {
+      this.beginLiveReasoning(sessionId, frame.turn, frame.step, frame.attemptId);
+      live = this.liveReasoning.get(key);
+    }
+    if (!live) return;
+    const mark = `${frame.attemptId ?? ""}:${chunk.index ?? live.text.length}`;
+    if (live.seen.has(mark)) return; // 第二个订阅者重复收到同一段
+    live.seen.add(mark);
+    live.text += chunk.text;
+  }
+
+  /** 落库后的整段 reasoning 比逐帧拼接权威，直接覆盖。 */
+  replaceLiveReasoning(sessionId, turn, step, text) {
+    const live = this.liveReasoning.get(String(sessionId));
+    if (!live) return;
+    if (turn != null && live.turn != null && turn !== live.turn) return;
+    live.text = text;
   }
 
   attachRegistry(registry) {
@@ -725,13 +821,16 @@ export class WidgetBridge {
       this.requirePrimary(identity);
       const body = await readBody(req);
       const ticket = this.pairing.start();
+      // The QR payload carries every reachable base URL, so the phone keeps
+      // working when it leaves the LAN and falls back to the tunnel.
+      const addrs = this.pairCandidates();
       this.audit.record({
         event: "pair-start",
         ip,
         label: typeof body.label === "string" ? body.label.slice(0, 60) : null,
         expiresAt: ticket.expiresAt,
       });
-      json(res, 200, ticket);
+      json(res, 200, { ...ticket, addrs, uri: pairingURI(addrs[0], ticket.code, addrs) });
       return;
     }
     if (pathname === "/v1/devices" && req.method === "GET") {
@@ -770,6 +869,13 @@ export class WidgetBridge {
       return;
     }
     this.authLimiter.reset(ip);
+
+    if (pathname === "/v1/endpoints" && req.method === "GET") {
+      // 手机在局域网里连上时顺手把候选地址刷新一次：quick tunnel 重建后
+      // 域名会变，不然出门就只能重新扫一次配对码。
+      json(res, 200, { addrs: this.pairCandidates(), updatedAt: new Date().toISOString() });
+      return;
+    }
 
     if (pathname.startsWith("/v1/attachments/") && req.method === "GET") {
       await this.serveAttachment(res, pathname.slice("/v1/attachments/".length));
@@ -1145,7 +1251,33 @@ export class WidgetBridge {
       }
     });
     try {
-      await write("ready", { sessionId });
+      // ready 带上服务端此刻的 running：客户端断线、切后台或切走会话都可能
+      // 错过 turn_end，重连后只能靠这个字段把状态行纠正回来，否则会永远
+      // 停在「思考中」。
+      let running = null;
+      try {
+        const rows = await controller.list({}, undefined);
+        const row = (rows?.items ?? []).find(
+          (item) => String(item?.sessionId) === String(sessionId),
+        );
+        if (row) running = row.running === true;
+      } catch {
+        running = null;
+      }
+      await write("ready", { sessionId, running });
+      // 服务端还在跑、而这一轮已经吐过思考：先把缓冲回放给刚连上的客户端，
+      // 否则状态行是一个空框，计时还得从 0 再算一遍。
+      if (running !== false) {
+        const live = this.liveReasoning.get(String(sessionId));
+        if (live?.text?.trim()) {
+          await write("reasoning_replay", {
+            turn: live.turn,
+            step: live.step,
+            text: live.text,
+            startedAt: live.startedAt,
+          });
+        }
+      }
       const follow = controller.follow({
         address: { kind: "session", sessionId },
         maxMessages: limit,
@@ -1188,6 +1320,7 @@ export class WidgetBridge {
             continue;
           }
           if (event?.type === "turn/end") {
+            this.liveReasoning.delete(String(sessionId));
             // The status row must stay for the whole turn, including the gaps
             // between steps where no assistant stream is open.
             await write("turn_end", {
@@ -1204,6 +1337,8 @@ export class WidgetBridge {
           if (event.type === "assistant/message") {
             const reasoning = partsOfContent(event.data?.message?.content).reasoning;
             if (reasoning.trim()) {
+              // 落库后的整段比逐帧拼接更权威，覆盖缓冲。
+              this.replaceLiveReasoning(sessionId, event.data?.turn, event.data?.step, reasoning);
               await write("reasoning_block", {
                 turn: event.data?.turn ?? null,
                 step: event.data?.step ?? null,
@@ -1217,6 +1352,7 @@ export class WidgetBridge {
         const frame = item.frame;
         if (!frame) continue;
         if (frame.type === "start") {
+          this.beginLiveReasoning(sessionId, frame.turn, frame.step, frame.attemptId);
           await write("assistant_start", {
             attemptId: frame.attemptId,
             turn: frame.turn,
@@ -1243,6 +1379,7 @@ export class WidgetBridge {
             text: chunk.text,
           });
         } else if (chunk.type === "reasoning-delta" && typeof chunk.text === "string" && chunk.text) {
+          this.appendLiveReasoning(sessionId, frame, chunk);
           await write("reasoning_delta", {
             attemptId: frame.attemptId,
             turn: frame.turn,
@@ -1269,6 +1406,21 @@ export class WidgetBridge {
       if (!res.writableEnded) res.end();
     }
   }
+
+  /**
+   * Every URL a pairing client could use, LAN first, then the public tunnel.
+   * The desktop widget puts the first one in the QR payload and lists the rest
+   * so a phone that scanned at home still works on cellular.
+   */
+  pairCandidates() {
+    const urls = lanAddresses(this.port);
+    // A live tunnel URL on disk wins over the launch config: the file is
+    // rewritten on every reconnect, whereas the config would go stale by design.
+    const publicUrl = runtimePublicUrl(this.publicUrlFile) ?? this.publicUrl;
+    if (publicUrl) urls.push(publicUrl.replace(/\/+$/u, ""));
+    if (!urls.length) urls.push("http://127.0.0.1:" + String(this.port));
+    return urls;
+  }
 }
 
 export const name = "dsh-widget-bridge";
@@ -1291,6 +1443,7 @@ export function apply(ctx, rawConfig = {}) {
     port: rawConfig.port,
     discoveryPath: rawConfig.discoveryPath,
     publicMode: rawConfig.publicMode,
+    publicUrl: rawConfig.publicUrl,
     devicesPath: rawConfig.devicesPath,
     auditPath: rawConfig.auditPath,
     pairingTtlMs: rawConfig.pairingTtlMs,

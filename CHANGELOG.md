@@ -5,7 +5,19 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-25
+
 ### Added
+
+- 隧道改为 macOS 用户级常驻服务：新增 `src/scripts/install-launchd.sh`（install/status/uninstall）与 `tunnel.sh run` 前台模式。脚本副本装到 `~/Library/Application Support/dshwidget-tunnel/`（`~/Documents` 受 TCC 保护，launchd 直接读那里会 `Operation not permitted`，退出码 126），plist 落 `~/Library/LaunchAgents/com.ryankiin.dshwidget.tunnel.plist`，`RunAtLoad` + `KeepAlive`。起因：隧道是 DSH 派生的子进程，`nohup` 挡不住 DSH 退出时的进程树清理，每次 Cmd+Q 都会被 SIGTERM 带走、域名再变、蜂窝必断。
+- `tunnel.sh run` 每 15 秒比对一次 discovery 里的端口，bridge 换端口就自行退出、由 launchd 用新端口重建。
+
+- 重连回放这一轮已产生的思考（`reasoning_replay`）：bridge 在内存里缓存正在流出的 `reasoning-delta`（按 `attemptId:index` 去重，同一会话多订阅者不会重复拼接；`assistant/message` 落库的整段覆盖缓存），新订阅者连上时在 `ready` 之后补发一条 `reasoning_replay`（`turn`/`step`/`text`/`startedAt` 毫秒），`turn/end` 清空。配合 iOS 端的 `BridgeEvent.reasoningReplay` 与 `ThinkingState`，解决「切后台/退会话再进来，思考框是空的、计时从 0 重来」。
+
+- 新增 `GET /v1/endpoints`（需设备 token）：返回此刻的候选地址（局域网 + 隧道）。配合 iOS 端 `BridgeClient.endpoints()` 与 `AppEnvironment.refreshCandidates()`——手机每次连上（在家 Wi-Fi 即可）就把候选地址刷新成最新的，quick tunnel 重建换了域名也不用重新扫配对码。
+
+- 隧道地址改为运行时可换：bridge 每次 `pair/start` 都重读 `~/.dsh/widget-public-url`（`runtimePublicUrl`），磁盘上有值就覆盖启动配置里的 `publicUrl`；换隧道、换网络都不用重启 DSH。`cordis.patch.yml` 里不再写死地址。
+- 新增 `src/scripts/tunnel.sh start|status|stop`：起 Cloudflare quick tunnel → 抓分配到的地址 → 写 `~/.dsh/widget-public-url`（0600）→ 探测 `/v1/health`（本机 DNS 被代理拦时用 `dig @1.1.1.1` 取 IP 再 `curl --resolve` 兜底，200 与 401 都算通）。端口默认跟随 `~/.dsh/widget-bridge.json` 里的实际端口，bridge 换端口后重跑 `start` 会自动重建隧道；`stop` 同时删地址文件，避免手机拿到死链。
 
 - SSE 事件带 `id:`（单连接内单调序号），并接受 `Last-Event-ID` 请求头（当前只记日志，跨连接回放留给云网关阶段）；旧客户端忽略未知行，无行为变化。
 
@@ -26,7 +38,19 @@
 - 新增 `src/bridge/security.js`（配对窗口、设备存储、限流器、审计日志）；bridge 测试新增配对、设备、吊销、501 与限流用例。
 - `GET /v1/sessions/{id}/history` 新增 `before=<seq>`：返回比该 seq 更早的一页（取最靠近 `before` 的 `limit` 条），`hasMore` 表示是否还有更早，供客户端向上翻历史；不传 `all`/`after`/`before` 时仍是尾部快照。协议文档同步。
 
+- 配对二维码：`POST /v1/pair/start` 的响应在票据之外新增 `addrs` 与 `uri`。
+  - `addrs`：`lanAddresses(port)` 枚举 `networkInterfaces()` 里非 internal 的 IPv4（跳过 169.254. 链接本地），形如 `http://192.168.1.18:49827`；配置了 `publicUrl`（或环境变量 `DSH_BRIDGE_PUBLIC_URL`）时追加该地址；一个都没有时回落 `http://127.0.0.1:<port>`。
+  - `uri`：`dshwidget://pair?v=1&u=<addrs[0]>&c=<6 位码>`，多地址时再带 `a=<addrs.join(",")>`，手机扫一次即拿到全部候选地址。
+- Mac 端「手机配对」卡片（`src/macos/DSHWidget/PairingView.swift`）：header 新增二维码按钮，卡片里是白底二维码（Core Image `qrCodeGenerator`，纠错级 M、8 倍放大）、`479 878` 形式的配对码与复制按钮、按秒刷新的有效期倒计时、前 3 个地址（标首选/备用）、「重新生成」。`BridgeClient.startPairing()` 对应 `POST v1/pair/start`；`WidgetModel.startPairing()` 在桥还没连上时先等最多 3 秒再请求，避免首次点击直接报「DSH 返回了无效响应」。
+- `test-mock.mjs` 新增 8 条配对 URI 断言（前缀、`v`/`u`/`c` 取值、`addrs` 与 `a` 的一致性）。
+
 ### Fixed
+
+- iOS 思考更新太碎：DSH 实测每秒约 8 片 `reasoning_delta`，原实现每片都整条复制一次消息列表，长回复下渲染追不上真实进度（表现为移动端还在思考、桌面已经答完，然后突然追平）。改为 120ms 合并写一次气泡；`reasoning_block`、`reasoning_replay`、`turn_end` 到来时立即冲刷，最终文本不丢。
+
+- 隧道脚本在 macOS 自带 bash 3.2 上会静默退出：`tunnel_url_from_log` 第一次循环时日志里还没有地址，`grep` 退出码 1 经 `pipefail` + `set -e` 直接把脚本干掉，表现是只打印「等待分配地址…」就结束、地址文件仍留着旧域名。函数尾部补 `|| true` 兜住。
+
+- 状态行残留：iOS 端「已回复结束但仍显示思考中」的根因是 `turn_end` 只在流里到达，断线、切后台或切走会话都会错过它，`ThinkingState` 于是永远停在 `.thinking`，会话列表也一直显示运行中。bridge 的 `ready` 帧新增 `running`（订阅时服务端的真实状态，取 `controller.list()` 里该会话的 `row.running`）；iOS 每次（重）连用它和服务端对账：服务端已 idle 就把残留状态收掉并补做 `settleBubbles()` 与思考回填，服务端还在跑就把状态行恢复出来。旧 bridge 不带该字段，客户端行为不变。
 
 - 客户端请求的条数少于 20 时，`history` 返回 400、SSE 返回 `error` 事件，文案是 `turnWindow.minMessages must be a positive safe integer no greater than maxMessages`：固定窗口的 `minMessages`(20) 大于 `maxMessages`(limit)。新增 `turnWindowFor(limit)` 把 `minMessages` 压到请求值，4 处 `follow/page` 全部改用它；测试里 mock controller 增加 `minMessages <= maxMessages` 断言与 `limit=3` 的回归用例。iOS 端另加 `BridgeClient.windowSafe(_:)` 下限兜底，连旧 bridge 也不会失败。
 

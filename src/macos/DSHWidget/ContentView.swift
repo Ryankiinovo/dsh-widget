@@ -31,6 +31,8 @@ struct ContentView: View {
     @StateObject private var viewer = ImageViewerState()
     /// Composer grows one line per newline, then scrolls.
     @StateObject private var composerHeight = ComposerHeightState()
+    /// Phone pairing card (QR + 6-digit fallback).
+    @StateObject private var pairing = PairingState()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -54,6 +56,7 @@ struct ContentView: View {
                 .stroke(Color.white.opacity(0.12), lineWidth: 1)
         )
         .overlay(ImageViewerOverlay(state: viewer))
+        .overlay(PairingOverlay(state: pairing, model: model))
         .environmentObject(viewer)
         .onAppear {
             keyMonitor.onSend = { model.send() }
@@ -136,6 +139,16 @@ struct ContentView: View {
             .help("切换会话")
 
             Spacer(minLength: 4)
+
+            Button {
+                pairing.open(model: model)
+            } label: {
+                Image(systemName: "qrcode")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("手机配对")
 
             Button {
                 model.newSession()
