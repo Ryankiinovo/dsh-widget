@@ -5,7 +5,30 @@
 
 ## [Unreleased]
 
-（暂无）
+### Added
+
+- SSE 事件带 `id:`（单连接内单调序号），并接受 `Last-Event-ID` 请求头（当前只记日志，跨连接回放留给云网关阶段）；旧客户端忽略未知行，无行为变化。
+
+- bridge 的工作区与归档能力，供 iOS 端做两级导航：
+  - `GET /v1/workspaces` 返回 `{id,title,path,sessionCount,updatedAt}`，按更新时间倒序；title 为空时用路径尾段。
+  - `GET /v1/sessions` 每项补 `workspaceId` 与 `archived`；**默认隐藏归档会话**（`?includeArchived=1` 可关），支持 `?workspaceId=` 过滤。
+  - 不属于任何工作区的旧会话归入合成的「未分组」桶（`__ungrouped`），避免它们从手机上消失。
+  - `capabilities` 增加 `workspaces`、`archivedFilter`。
+  - 端口被占用（EADDRINUSE）时回退随机端口而不是整个 bridge 起不来；`cordis.patch.yml` 固定 `port: 49827`。
+- bridge 具备公网访问前置能力（协议 version 1 → 2，旧客户端不受影响）：
+  - 设备配对：`POST /v1/pair/start`（需主 token）开 120 秒的 6 位码窗口，`POST /v1/pair/claim {code, name}` 换取设备 token；码单次使用、错 10 次锁定，明文 token 只返回一次，磁盘上只存 sha256。
+  - 设备管理：`GET /v1/devices` 列出设备，`DELETE /v1/devices/{id}` 立即吊销。
+  - 限流：每 IP 60 秒 240 次、全局 1200 次，超限 429 + `retry-after`；未认证请求连续失败 10 次锁 5 分钟。
+  - 审计：`~/.dsh/widget-audit.log`（JSONL、0600、2 MB 轮转）记录 ip/方法/路径/状态/耗时与设备。
+  - `GET /v1/health` 增加 `publicMode` 与 `capabilities` 对象（配对、设备吊销、图片上限、reasoning、toolTrace、push=false）。
+  - 带 `Origin` 的请求一律拒绝；`POST /v1/push/register` 预留返回 501。
+  - 协议文档 `docs/protocol.md` 升到 v2，并同步到 iOS 仓副本。
+- 新增 `src/bridge/security.js`（配对窗口、设备存储、限流器、审计日志）；bridge 测试新增配对、设备、吊销、501 与限流用例。
+- `GET /v1/sessions/{id}/history` 新增 `before=<seq>`：返回比该 seq 更早的一页（取最靠近 `before` 的 `limit` 条），`hasMore` 表示是否还有更早，供客户端向上翻历史；不传 `all`/`after`/`before` 时仍是尾部快照。协议文档同步。
+
+### Fixed
+
+- 客户端请求的条数少于 20 时，`history` 返回 400、SSE 返回 `error` 事件，文案是 `turnWindow.minMessages must be a positive safe integer no greater than maxMessages`：固定窗口的 `minMessages`(20) 大于 `maxMessages`(limit)。新增 `turnWindowFor(limit)` 把 `minMessages` 压到请求值，4 处 `follow/page` 全部改用它；测试里 mock controller 增加 `minMessages <= maxMessages` 断言与 `limit=3` 的回归用例。iOS 端另加 `BridgeClient.windowSafe(_:)` 下限兜底，连旧 bridge 也不会失败。
 
 ## [0.2.0] - 2026-10-24
 

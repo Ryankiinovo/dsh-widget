@@ -7,7 +7,7 @@
 > 非官方社区项目，与 DeepSeek 无隶属关系。
 > 早期版本：**Apple Silicon / macOS 14+**，ad-hoc 签名，**未公证**。
 
-**最新版本：** [v0.2.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.2.0)
+**最新版本：** [v0.3.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.3.0)
 
 ## 功能
 

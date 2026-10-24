@@ -11,7 +11,7 @@ A macOS desktop widget for the DeepSeek Harness desktop app: keep the current se
 
 ![status](https://img.shields.io/badge/status-early%20preview-orange)
 
-**Latest release:** [v0.2.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.2.0)
+**Latest release:** [v0.3.0](https://github.com/Ryankiinovo/dsh-widget/releases/tag/v0.3.0)
 
 ## What it does
 

@@ -22,8 +22,18 @@ import {
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, sep } from "node:path";
+import {
+  AuditLog,
+  DeviceStore,
+  PAIRING_TTL_MS,
+  PairingStore,
+  RateLimiter,
+  safeEqual,
+} from "./security.js";
 
 const DEFAULT_DISCOVERY = join(homedir(), ".dsh", "widget-bridge.json");
+const DEFAULT_DEVICES = join(homedir(), ".dsh", "widget-devices.json");
+const DEFAULT_AUDIT = join(homedir(), ".dsh", "widget-audit.log");
 const DEFAULT_LIMIT = 500;
 const MAX_BODY_BYTES = 1024 * 1024;
 // A pasted screenshot is base64 inside the prompt body, so this route needs a
@@ -31,10 +41,47 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_PROMPT_BODY_BYTES = 32 * 1024 * 1024;
 const MAX_PROMPT_IMAGES = 8;
 const HEARTBEAT_MS = 15000;
+// Protocol version 2 adds capabilities to /v1/health, device pairing and
+// per-device tokens. Version 1 clients only read ok/pid/version, so the bump
+// stays backward compatible.
+const BRIDGE_VERSION = 2;
+const DEFAULT_RATE_PER_MINUTE = 240;
+const GLOBAL_RATE_PER_MINUTE = 1200;
+const AUTH_LOCK_MS = 5 * 60 * 1000;
+const AUTH_FAILURES_BEFORE_LOCK = 10;
+const CAPABILITIES = Object.freeze({
+  protocolVersion: BRIDGE_VERSION,
+  pairing: true,
+  deviceRevoke: true,
+  push: false,
+  images: true,
+  maxImages: MAX_PROMPT_IMAGES,
+  reasoning: true,
+  toolTrace: true,
+  multiDevice: true,
+  workspaces: true,
+  archivedFilter: true,
+});
 // maxMessages counts event records, not chat messages. Ask DSH for both a
 // bounded event window and a minimum conversation window so opening a long
 // session still shows a few rounds instead of only the latest tool events.
 const TURN_WINDOW = Object.freeze({ minMessages: 20, minTurns: 2 });
+// Sessions created before workspaces existed (or by an older host) carry no
+// membership. Hiding them would make them unreachable from the phone, so they
+// surface under one synthetic bucket instead.
+const UNGROUPED_WORKSPACE_ID = "__ungrouped";
+
+/**
+ * DSH rejects a request whose turnWindow.minMessages exceeds maxMessages, so a
+ * caller asking for fewer than 20 records narrows the turn window instead of
+ * being turned into a 400.
+ */
+function turnWindowFor(limit) {
+  if (!Number.isSafeInteger(limit) || limit <= 0 || limit >= TURN_WINDOW.minMessages) {
+    return TURN_WINDOW;
+  }
+  return { ...TURN_WINDOW, minMessages: limit };
+}
 const HISTORY_MIN_MESSAGES = 20;
 const HISTORY_PAGE_GUARD = 8;
 const HISTORY_ALL_PAGE_GUARD = 200;
@@ -50,6 +97,16 @@ function json(res, status, value) {
   res.end(body);
 }
 
+function clientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    // A reverse proxy (Tailscale Funnel) reports the real client here. The
+    // value is advisory: it only feeds rate limiting, never authorization.
+    return forwarded.split(",")[0].trim().slice(0, 64);
+  }
+  return String(req.socket?.remoteAddress ?? "");
+}
+
 function errorBody(error) {
   const code = typeof error?.code === "string" ? error.code : "gateway/internal";
   const message = error instanceof Error ? error.message : String(error);
@@ -59,8 +116,14 @@ function errorBody(error) {
 function statusFor(error) {
   const code = typeof error?.code === "string" ? error.code : "";
   if (code === "gateway/bad-request" || code.endsWith("-invalid")) return 400;
+  if (code === "pairing/not-started" || code === "pairing/expired") return 400;
+  if (code === "pairing/invalid-code" || code === "gateway/unauthorized") return 401;
+  if (code === "gateway/forbidden") return 403;
+  if (code === "gateway/not-found") return 404;
   if (code === "session/not-found" || code === "subagent/not-found" || code === "workspace/not-found") return 404;
   if (code === "session/agent-busy" || code === "session/writer-held") return 409;
+  if (code === "pairing/too-many-attempts" || code === "gateway/rate-limited" || code === "gateway/auth-locked") return 429;
+  if (code === "gateway/not-implemented") return 501;
   return 500;
 }
 
@@ -204,6 +267,18 @@ function listTitle(row) {
   return cwd ? basename(cwd) : shortId(row?.sessionId);
 }
 
+function normalizeWorkspace(workspace) {
+  const path = typeof workspace.path === "string" ? workspace.path : null;
+  const rawTitle = typeof workspace.title === "string" ? workspace.title.trim() : "";
+  return {
+    id: String(workspace.id),
+    title: rawTitle || (path ? basename(path) : String(workspace.id)),
+    path,
+    sessionCount: Array.isArray(workspace.sessionIds) ? workspace.sessionIds.length : 0,
+    updatedAt: Number(workspace.updatedAt) || 0,
+  };
+}
+
 function normalizeSession(row) {
   return {
     id: row.sessionId,
@@ -270,6 +345,27 @@ export class WidgetBridge {
     // Resolved lazily: the attachment service may register after the bridge
     // starts, and the widget only needs it for image prompts.
     this.resolveAttachments = options.resolveAttachments ?? null;
+    // Loopback mode can rely on the host token alone. Once the bridge is
+    // reachable from the network, each client needs its own revocable
+    // credential, so pairing and per-device tokens are always available.
+    this.publicMode =
+      options.publicMode ??
+      (this.host !== "127.0.0.1" && this.host !== "localhost" && this.host !== "::1");
+    this.pairing = new PairingStore({ ttlMs: options.pairingTtlMs ?? PAIRING_TTL_MS });
+    this.devices = new DeviceStore({ path: options.devicesPath ?? DEFAULT_DEVICES });
+    this.audit = new AuditLog({ path: options.auditPath ?? DEFAULT_AUDIT });
+    this.requestLimiter = new RateLimiter({
+      windowMs: 60_000,
+      max: options.requestsPerMinute ?? DEFAULT_RATE_PER_MINUTE,
+    });
+    this.globalLimiter = new RateLimiter({
+      windowMs: 60_000,
+      max: options.globalRequestsPerMinute ?? GLOBAL_RATE_PER_MINUTE,
+    });
+    this.authLimiter = new RateLimiter({
+      windowMs: AUTH_LOCK_MS,
+      max: options.authFailuresBeforeLock ?? AUTH_FAILURES_BEFORE_LOCK,
+    });
     this.server = null;
     this.started = false;
     this.stopping = false;
@@ -325,6 +421,46 @@ export class WidgetBridge {
     }
   }
 
+  /** sessionId -> workspaceId, built from the registry's membership lists. */
+  sessionWorkspaceIndex() {
+    const index = new Map();
+    if (!this.registry || typeof this.registry.list !== "function") return index;
+    try {
+      for (const workspace of this.registry.list()) {
+        for (const sessionId of workspace.sessionIds ?? []) {
+          index.set(String(sessionId), String(workspace.id));
+        }
+      }
+    } catch {
+      return index;
+    }
+    return index;
+  }
+
+  archivedSessionSet() {
+    if (!this.registry) return new Set();
+    try {
+      return new Set((this.registry.archivedSessionIds ?? []).map(String));
+    } catch {
+      return new Set();
+    }
+  }
+
+  /** Live sessions that no workspace claims; they get the "未分组" bucket. */
+  async ungroupedSessions() {
+    try {
+      const rows = await this.requireController().list({}, undefined);
+      const index = this.sessionWorkspaceIndex();
+      const archived = this.archivedSessionSet();
+      return (rows?.items ?? [])
+        .map((row) => normalizeSession(row))
+        .filter((session) => !archived.has(String(session.id)))
+        .filter((session) => !index.get(String(session.id)));
+    } catch {
+      return [];
+    }
+  }
+
   /**
    * Attach pre-existing sessions whose cwd matches a registered Workspace but
    * which are not members of it yet (created before cwd resolution existed).
@@ -368,6 +504,8 @@ export class WidgetBridge {
       port: this.port,
       token: this.token,
       startedAt: new Date().toISOString(),
+      publicMode: this.publicMode,
+      capabilities: CAPABILITIES,
     };
     const temporary = this.discoveryPath + "." + String(process.pid) + ".tmp";
     writeFileSync(temporary, JSON.stringify(payload), { mode: 0o600 });
@@ -386,19 +524,37 @@ export class WidgetBridge {
   async start() {
     if (this.started) return this;
     if (this.stopping) throw new Error("bridge is stopping");
-    await new Promise((resolve, reject) => {
-      const onError = (error) => {
-        this.server.off("listening", onListening);
-        reject(error);
-      };
-      const onListening = () => {
-        this.server.off("error", onError);
-        resolve();
-      };
-      this.server.once("error", onError);
-      this.server.once("listening", onListening);
-      this.server.listen(this.port, this.host);
-    });
+    const listen = (port) =>
+      new Promise((resolve, reject) => {
+        const onError = (error) => {
+          this.server.off("listening", onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          this.server.off("error", onError);
+          resolve();
+        };
+        this.server.once("error", onError);
+        this.server.once("listening", onListening);
+        this.server.listen(port, this.host);
+      });
+    try {
+      await listen(this.port);
+    } catch (error) {
+      // A fixed port that is already taken (second Host instance, another
+      // process) must never take the bridge offline: fall back to an
+      // ephemeral port and let discovery carry the real value.
+      if (this.port === 0 || error?.code !== "EADDRINUSE") throw error;
+      this.logger.error(
+        "[dsh-widget-bridge] port " + String(this.port) + " is busy, falling back to an ephemeral port",
+      );
+      try {
+        this.server.close();
+      } catch {
+        /* not listening yet; nothing to close */
+      }
+      await listen(0);
+    }
     const address = this.server.address();
     if (!address || typeof address === "string") throw new Error("bridge did not bind a TCP port");
     this.port = address.port;
@@ -425,17 +581,56 @@ export class WidgetBridge {
     this.started = false;
   }
 
-  authorized(req) {
-    if (req.headers.origin) return false;
+  /** Resolve the caller: the host token, or one paired device's token. */
+  identity(req) {
+    if (req.headers.origin) return null;
     const header = req.headers.authorization;
-    if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
+    if (typeof header !== "string" || !header.startsWith("Bearer ")) return null;
     const provided = header.slice("Bearer ".length).trim();
-    if (provided.length !== this.token.length) return false;
-    let mismatch = 0;
-    for (let index = 0; index < provided.length; index += 1) {
-      mismatch |= provided.charCodeAt(index) ^ this.token.charCodeAt(index);
+    if (!provided) return null;
+    if (safeEqual(provided, this.token)) return { primary: true, device: null };
+    const device = this.devices.verify(provided);
+    return device ? { primary: false, device } : null;
+  }
+
+  authorized(req) {
+    return this.identity(req) !== null;
+  }
+
+  /** Device management always requires the host token, never a device token. */
+  requirePrimary(identity) {
+    if (!identity) {
+      const error = new Error("widget token required");
+      error.code = "gateway/unauthorized";
+      throw error;
     }
-    return mismatch === 0;
+    if (!identity.primary) {
+      const error = new Error("host token required");
+      error.code = "gateway/forbidden";
+      throw error;
+    }
+  }
+
+  /**
+   * Second half of pairing: the code proves the user was in front of the host,
+   * and this call mints that device's own token exactly once.
+   */
+  async claimPairing(req, res, ip) {
+    const body = await readBody(req);
+    const result = this.pairing.claim(body.code);
+    if (!result.ok) {
+      const error = new Error("pairing failed");
+      error.code = result.error;
+      throw error;
+    }
+    const created = this.devices.addDevice({ name: body.name, ip });
+    this.audit.record({
+      event: "pair-claim",
+      ip,
+      deviceId: created.device.id,
+      label: created.device.name,
+    });
+    json(res, 200, { deviceToken: created.token, device: created.device });
   }
 
   /// Serve one content-addressed attachment from the DSH attachment store.
@@ -476,28 +671,151 @@ export class WidgetBridge {
   async handle(req, res) {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = url.pathname;
+    const ip = clientIp(req);
+    const startedAt = Date.now();
+    const identity = this.identity(req);
+    res.on("close", () => {
+      this.audit.record({
+        event: "request",
+        ip,
+        method: req.method,
+        path: pathname,
+        status: res.statusCode,
+        ms: Date.now() - startedAt,
+        deviceId: identity?.device?.id ?? null,
+        primary: identity?.primary === true,
+      });
+    });
 
-    if (pathname === "/v1/health" && req.method === "GET") {
-      json(res, 200, { ok: true, pid: process.pid, version: 1 });
-      return;
-    }
     if (!pathname.startsWith("/v1/")) {
       json(res, 404, { error: { code: "gateway/not-found", message: "not found" } });
       return;
     }
-    if (!this.authorized(req)) {
+
+    const perIp = this.requestLimiter.hit(ip);
+    const global = this.globalLimiter.hit("all");
+    if (!perIp.allowed || !global.allowed) {
+      const retryAfterMs = Math.max(perIp.retryAfterMs, global.retryAfterMs);
+      res.setHeader("retry-after", String(Math.max(1, Math.ceil(retryAfterMs / 1000))));
+      json(res, 429, { error: { code: "gateway/rate-limited", message: "too many requests" } });
+      return;
+    }
+
+    // Health is public on purpose: a client must be able to learn the protocol
+    // version and capabilities before it holds any token.
+    if (pathname === "/v1/health" && req.method === "GET") {
+      json(res, 200, {
+        ok: true,
+        pid: process.pid,
+        version: BRIDGE_VERSION,
+        publicMode: this.publicMode,
+        capabilities: CAPABILITIES,
+      });
+      return;
+    }
+
+    // The pairing code is itself the credential for the claim call, so it is
+    // the one state-changing route without a token: rate limited above and
+    // burned after ten wrong guesses.
+    if (pathname === "/v1/pair/claim" && req.method === "POST") {
+      await this.claimPairing(req, res, ip);
+      return;
+    }
+    if (pathname === "/v1/pair/start" && req.method === "POST") {
+      this.requirePrimary(identity);
+      const body = await readBody(req);
+      const ticket = this.pairing.start();
+      this.audit.record({
+        event: "pair-start",
+        ip,
+        label: typeof body.label === "string" ? body.label.slice(0, 60) : null,
+        expiresAt: ticket.expiresAt,
+      });
+      json(res, 200, ticket);
+      return;
+    }
+    if (pathname === "/v1/devices" && req.method === "GET") {
+      this.requirePrimary(identity);
+      json(res, 200, { devices: this.devices.list() });
+      return;
+    }
+    const deviceMatch = /^\/v1\/devices\/([^/]+)$/u.exec(pathname);
+    if (deviceMatch && req.method === "DELETE") {
+      this.requirePrimary(identity);
+      const deviceId = decodeURIComponent(deviceMatch[1]);
+      if (!this.devices.revoke(deviceId)) {
+        const error = new Error("device not found");
+        error.code = "gateway/not-found";
+        throw error;
+      }
+      this.audit.record({ event: "device-revoke", ip, deviceId });
+      json(res, 200, { deviceId, revoked: true });
+      return;
+    }
+    if (pathname === "/v1/push/register" && req.method === "POST") {
+      json(res, 501, {
+        error: { code: "gateway/not-implemented", message: "push registration is not implemented yet" },
+      });
+      return;
+    }
+
+    if (!identity) {
+      const gate = this.authLimiter.hit(ip);
+      if (!gate.allowed) {
+        res.setHeader("retry-after", String(Math.max(1, Math.ceil(gate.retryAfterMs / 1000))));
+        json(res, 429, { error: { code: "gateway/auth-locked", message: "too many failed attempts" } });
+        return;
+      }
       json(res, 401, { error: { code: "gateway/unauthorized", message: "widget token required" } });
       return;
     }
+    this.authLimiter.reset(ip);
 
     if (pathname.startsWith("/v1/attachments/") && req.method === "GET") {
       await this.serveAttachment(res, pathname.slice("/v1/attachments/".length));
       return;
     }
 
+    if (pathname === "/v1/workspaces" && req.method === "GET") {
+      const list =
+        this.registry && typeof this.registry.list === "function" ? this.registry.list() : [];
+      const workspaces = list.map(normalizeWorkspace).sort((a, b) => b.updatedAt - a.updatedAt);
+      const ungrouped = await this.ungroupedSessions();
+      if (ungrouped.length > 0) {
+        workspaces.push({
+          id: UNGROUPED_WORKSPACE_ID,
+          title: "未分组",
+          path: "",
+          sessionCount: ungrouped.length,
+          updatedAt: Math.max(...ungrouped.map((session) => session.updatedAt || 0)),
+        });
+      }
+      json(res, 200, { workspaces });
+      return;
+    }
+
     if (pathname === "/v1/sessions" && req.method === "GET") {
       const rows = await this.requireController().list({}, undefined);
-      json(res, 200, { sessions: (rows?.items ?? []).map(normalizeSession) });
+      const archived = this.archivedSessionSet();
+      const includeArchived = ["1", "true"].includes(
+        String(url.searchParams.get("includeArchived") ?? "").toLowerCase(),
+      );
+      const workspaceFilter = url.searchParams.get("workspaceId");
+      const index = this.sessionWorkspaceIndex();
+      let sessions = (rows?.items ?? []).map((row) => {
+        const session = normalizeSession(row);
+        session.workspaceId = index.get(String(session.id)) ?? null;
+        session.archived = archived.has(String(session.id));
+        return session;
+      });
+      // Archived sessions are hidden by default: they are dead ends on a phone.
+      if (!includeArchived) sessions = sessions.filter((session) => session.archived !== true);
+      if (workspaceFilter === UNGROUPED_WORKSPACE_ID) {
+        sessions = sessions.filter((session) => !session.workspaceId);
+      } else if (workspaceFilter) {
+        sessions = sessions.filter((session) => session.workspaceId === workspaceFilter);
+      }
+      json(res, 200, { sessions });
       return;
     }
 
@@ -571,10 +889,15 @@ export class WidgetBridge {
         const all = allValue === "1" || allValue === "true";
         const afterValue = url.searchParams.get("after");
         const afterSeq = afterValue === null ? null : parseAfterSeq(afterValue);
-        if (all || afterSeq !== null) {
+        // before=<seq> pages further back than a client's oldest message; the
+        // tail snapshot alone cannot serve a long session's scrollback.
+        const beforeValue = url.searchParams.get("before");
+        const beforeSeq = beforeValue === null ? null : parseAfterSeq(beforeValue);
+        if (all || afterSeq !== null || beforeSeq !== null) {
           const page = await this.readHistory(sessionId, limit, {
-            all: all && afterSeq === null,
+            all: all && afterSeq === null && beforeSeq === null,
             afterSeq,
+            beforeSeq,
           });
           const seqs = page.messages.map((message) => message.seq).filter(Number.isSafeInteger);
           json(res, 200, {
@@ -687,7 +1010,7 @@ export class WidgetBridge {
         throughSeq: snapshot.cursor,
         beforeSeq,
         maxMessages: limit,
-        turnWindow: TURN_WINDOW,
+        turnWindow: turnWindowFor(limit),
       }, pageSignal);
       const pageRecordsValue = Array.isArray(older?.records) ? older.records : [];
       const fresh = pageRecordsValue.filter((record) => {
@@ -709,7 +1032,7 @@ export class WidgetBridge {
     const iterator = controller.follow({
       address: { kind: "session", sessionId },
       maxMessages: limit,
-      turnWindow: TURN_WINDOW,
+      turnWindow: turnWindowFor(limit),
       assistantStream: false,
     }, abort.signal)[Symbol.asyncIterator]();
     try {
@@ -737,7 +1060,7 @@ export class WidgetBridge {
    * covered, or until the caller asked for everything. The page guard keeps a
    * corrupt/looping Host from turning this into an unbounded request.
    */
-  async readHistory(sessionId, limit, { all = false, afterSeq = null } = {}) {
+  async readHistory(sessionId, limit, { all = false, afterSeq = null, beforeSeq = null } = {}) {
     const controller = this.requireController();
     const pageSignal = new AbortController().signal;
     const snapshot = await this.readTailSnapshot(sessionId, limit);
@@ -745,20 +1068,24 @@ export class WidgetBridge {
     let messages = messagesFromSnapshot({ records });
     let hasMore = snapshot?.hasMore === true;
     const seen = new Set(records.map((record) => record?.event?.seq).filter(Number.isSafeInteger));
-    const maxPages = all ? HISTORY_ALL_PAGE_GUARD : HISTORY_AFTER_PAGE_GUARD;
+    const maxPages = all || beforeSeq !== null ? HISTORY_ALL_PAGE_GUARD : HISTORY_AFTER_PAGE_GUARD;
+    const olderThan = (seq) => messages.filter((message) => Number.isSafeInteger(message.seq) && message.seq < seq);
     for (let page = 0; page < maxPages && hasMore; page += 1) {
+      // Walking back for a client's scrollback stops as soon as one page of
+      // messages older than its oldest seq has been collected.
+      if (beforeSeq !== null && olderThan(beforeSeq).length >= limit) break;
       const seqs = records.map((record) => record?.event?.seq).filter(Number.isSafeInteger);
       if (seqs.length === 0) break;
-      const beforeSeq = Math.min(...seqs);
-      if (beforeSeq <= 0) break;
-      if (afterSeq !== null && beforeSeq <= afterSeq) break;
-      if (!all && afterSeq === null && messages.length >= HISTORY_MIN_MESSAGES) break;
+      const oldestSeq = Math.min(...seqs);
+      if (oldestSeq <= 0) break;
+      if (afterSeq !== null && oldestSeq <= afterSeq) break;
+      if (!all && afterSeq === null && beforeSeq === null && messages.length >= HISTORY_MIN_MESSAGES) break;
       const older = await controller.page({
         address: { kind: "session", sessionId },
         throughSeq: snapshot.cursor,
-        beforeSeq,
+        beforeSeq: oldestSeq,
         maxMessages: limit,
-        turnWindow: TURN_WINDOW,
+        turnWindow: turnWindowFor(limit),
       }, pageSignal);
       const pageRecordsValue = Array.isArray(older?.records) ? older.records : [];
       const fresh = pageRecordsValue.filter((record) => {
@@ -773,6 +1100,10 @@ export class WidgetBridge {
     }
     if (afterSeq !== null) {
       messages = messages.filter((message) => Number.isSafeInteger(message.seq) && message.seq > afterSeq);
+    }
+    if (beforeSeq !== null) {
+      const older = olderThan(beforeSeq);
+      return { messages: older.slice(-limit), hasMore: older.length > limit || hasMore };
     }
     return { messages, hasMore };
   }
@@ -794,10 +1125,21 @@ export class WidgetBridge {
       if (!res.writableEnded) res.write(": ping\n\n");
     }, HEARTBEAT_MS);
     heartbeat.unref?.();
+    // 每个事件带单调 id，客户端据此实现 Last-Event-ID 续传。注意：id 只在
+    // 单条连接内有效，跨连接续传需要全局事件号（云网关阶段再补）。
+    let eventSeq = 0;
+    const resumeFrom = String(req.headers["last-event-id"] ?? "").trim();
+    if (resumeFrom) {
+      this.logger?.info?.("[dsh-widget-bridge] stream resume requested from " + resumeFrom);
+    }
     const write = (event, data) => new Promise((resolve) => {
       if (res.writableEnded) return resolve();
       try {
-        res.write("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n", () => resolve());
+        eventSeq += 1;
+        res.write(
+          "id: " + eventSeq + "\nevent: " + event + "\ndata: " + JSON.stringify(data) + "\n\n",
+          () => resolve()
+        );
       } catch {
         resolve();
       }
@@ -807,7 +1149,7 @@ export class WidgetBridge {
       const follow = controller.follow({
         address: { kind: "session", sessionId },
         maxMessages: limit,
-        turnWindow: TURN_WINDOW,
+        turnWindow: turnWindowFor(limit),
         assistantStream: true,
       }, abort.signal);
       for await (const item of follow) {
@@ -948,6 +1290,10 @@ export function apply(ctx, rawConfig = {}) {
     host: rawConfig.host,
     port: rawConfig.port,
     discoveryPath: rawConfig.discoveryPath,
+    publicMode: rawConfig.publicMode,
+    devicesPath: rawConfig.devicesPath,
+    auditPath: rawConfig.auditPath,
+    pairingTtlMs: rawConfig.pairingTtlMs,
   });
   let disposed = false;
   let injectDispose;
