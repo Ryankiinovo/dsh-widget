@@ -227,6 +227,33 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.top, 50)
                     }
+                    // A long session opens on its recent page. This sits at the
+                    // top of the ladder, so the transcript grows upwards only
+                    // when the reader actually scrolls up for it.
+                    if model.hasEarlier {
+                        Button {
+                            model.loadEarlier()
+                        } label: {
+                            HStack(spacing: 5) {
+                                if model.isLoadingEarlier {
+                                    ProgressView()
+                                        .controlSize(.mini)
+                                } else {
+                                    Image(systemName: "arrow.up")
+                                        .font(.system(size: 9, weight: .semibold))
+                                }
+                                Text(model.isLoadingEarlier ? "正在加载" : "加载更早")
+                                    .font(.system(size: 11))
+                            }
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.isLoadingEarlier)
+                        .padding(.bottom, 4)
+                    }
                     ForEach(Array(model.visibleMessages.enumerated()), id: \.element.id) { index, message in
                         // While an answer streams, the status line sits directly
                         // above that bubble: "上面在生成、下面出气泡" instead of the

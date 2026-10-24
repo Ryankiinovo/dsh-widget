@@ -5,6 +5,18 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-25
+
+### Fixed
+
+- **打开大会话卡顿**：首屏不再 `/history?all=1` 全量拉取，改为约 200 条的窗口，窗口上沿「加载更早」按需向前翻页；`Transcript` 从逐条 O(n²) 文本比较改成一次遍历建索引（id/seq/turn+step/pendingUser/text），相似度只扫尾部 80 条；`applyHistory` 用 `Set` 判重；Markdown 解析结果进 `NSCache`（400 条上限）。562 条会话的打开时间从数十秒降到首屏直出。
+- **「思考中」不收敛**：`assistant_end`/`turn_end` 现在清掉所有 `streaming` 标记（原来只清命中 `streamingID` 的那条，`turn=-1 step=-1` 的流式块会把气泡永久钉在 streaming），对账条件补上 `activity.isRunning`，静默 3 秒后允许自愈补拉，不再被 `hasStreamingBubble` 永久挡住。
+
+### Added
+
+- bridge 的 `GET /v1/sessions/{id}/history` 新增窗口语义：不传 `all`/`after`/`before` 时由 `readWindow` 从尾部向前翻页、攒够 `limit` 条再返回，并给出 `oldestSeq`/`hasMore`，客户端据此显示「加载更早」。
+- App 消息区顶部新增「加载更早」按钮（加载中转圈）；`BridgeClient.history` 支持 `before` 参数。
+
 ## [0.4.0] - 2026-10-25
 
 ### Added

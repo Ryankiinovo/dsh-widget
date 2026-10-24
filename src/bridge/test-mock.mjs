@@ -229,6 +229,22 @@ try {
   assert.equal(smallHistory.status, 200);
   const smallBody = await smallHistory.json();
   assert.ok(Array.isArray(smallBody.messages));
+  // The first paint is a window, so it must carry the sequence bounds:
+  // without oldestSeq the client cannot ask for the page above it.
+  const smallSeqs = smallBody.messages.map((message) => message.seq).filter(Number.isSafeInteger);
+  assert.ok(smallSeqs.length > 0);
+  assert.equal(smallBody.oldestSeq, Math.min(...smallSeqs));
+  assert.equal(smallBody.newestSeq, Math.max(...smallSeqs));
+  // A window must keep paging until it is full: the tail snapshot alone only
+  // carried the newest bubbles, which is what made a 500-message session open
+  // with two visible fragments.
+  assert.equal(smallBody.messages.length, 3);
+  assert.deepEqual(
+    [...smallSeqs].sort((a, b) => a - b),
+    [0, 1, 2],
+    "the window walked back past the tail snapshot"
+  );
+  assert.equal(smallBody.hasMore, false);
 
   const allHistory = await fetch(
     "http://127.0.0.1:" + discovery.port + "/v1/sessions/session-old/history?all=1",

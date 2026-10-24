@@ -24,6 +24,10 @@ final class WidgetModel: ObservableObject {
     @Published var activity = ThinkingActivity()
     @Published var isLoadingHistory = false
     @Published var isSyncingHistory = false
+    /// The host has more messages above the current window. A 500+ turn session
+    /// is opened as its recent page and grows only when the reader asks.
+    @Published var hasEarlier = false
+    @Published var isLoadingEarlier = false
     @Published var syncStatus: String?
 
     var visibleMessages: [ChatMessage] {
@@ -69,11 +73,20 @@ final class WidgetModel: ObservableObject {
     private var autoSyncAfterReconnect = false
     private var syncTask: Task<Void, Never>?
     private var syncStatusTask: Task<Void, Never>?
-    /// Full transcripts are cached per session so switching back is instant.
+    /// Recent-window cache per session so switching back is instant.
     /// The cache is deliberately small; recent sessions are the common case.
-    private var fullHistoryCache: [String: [ChatMessage]] = [:]
+    private struct CachedTranscript {
+        var messages: [ChatMessage]
+        var hasEarlier: Bool
+        var earliestSeq: Int?
+    }
+    private var fullHistoryCache: [String: CachedTranscript] = [:]
     private var fullHistoryOrder: [String] = []
-    private var fullHistoryLoaded: Set<String> = []
+    /// Oldest sequence in the window on screen; the cursor for "load earlier".
+    private var earliestSeq: Int?
+    /// Bubbles pulled per page. Large enough to fill the visible panel, small
+    /// enough that opening a 500+ turn session is not a full import.
+    static let historyPageSize = 200
     private let selectedKey = "dshWidget.selectedSession"
     /// Test runs must not disturb the real app's remembered session.
     private let isTestRun = ProcessInfo.processInfo.environment["DSHWIDGET_TEST"] == "1"
@@ -357,7 +370,10 @@ final class WidgetModel: ObservableObject {
             idleTicks = 0
             return
         }
-        guard isRunning || hasStreamingBubble else {
+        // activity.isRunning belongs here too: a lost turnEnd left the spinner
+        // animating while both flags above were already false, so the poll
+        // stopped watching and the widget looked busy forever.
+        guard isRunning || hasStreamingBubble || activity.isRunning else {
             // The first poll already turned isRunning off but a lost end frame
             // can leave a spinner behind; give it one more tick, then settle.
             if idleTicks > 0 {
@@ -366,7 +382,7 @@ final class WidgetModel: ObservableObject {
                 // split a reply in two: the reply pauses between frames (long
                 // reasoning, a tool call), DSH reports idle meanwhile, and the
                 // settled bubble then sat next to the authoritative copy.
-                if idleTicks >= 2 { silentSyncHistory(reason: "reconcile-idle") }
+                if idleTicks >= 2 { finishBusyState(reason: "reconcile-idle") }
             }
             return
         }
@@ -383,13 +399,37 @@ final class WidgetModel: ObservableObject {
                 return
             }
             idleTicks += 1
-            WidgetLog.event("reconcile", "idle=\(idleTicks) streaming=\(hasStreamingBubble)")
+            WidgetLog.event("reconcile", "idle=\(idleTicks) streaming=\(hasStreamingBubble) activity=\(activity.isRunning)")
             if idleTicks >= 2 {
-                silentSyncHistory(reason: "reconcile-idle")
+                finishBusyState(reason: "reconcile-idle")
             }
         } catch {
             // refreshSessions owns the offline transition.
         }
+    }
+
+    /// The host reports the session idle, so the spinner must stop even when no
+    /// end frame arrived, then pull whatever the event window missed.
+    private func finishBusyState(reason: String) {
+        if activity.isRunning {
+            WidgetLog.event("activity-settle", "reason=\(reason) turn=\(activity.turn ?? -1) step=\(activity.step ?? -1)")
+            withAnimation(.easeOut(duration: 0.45)) { activity.finish(at: Date()) }
+        }
+        silentSyncHistory(reason: reason)
+    }
+
+    /// A stream frame can finish a step whose start the widget never saw, so the
+    /// live bubble keeps streaming=true. That flag then blocks every tail sync
+    /// as if a reply were still in flight, and the spinner never settles. Clear
+    /// it on every assistant bubble once the turn is known to be over.
+    private func clearStreamingFlags() {
+        var changed = false
+        for index in messages.indices where messages[index].role == "assistant" && messages[index].streaming {
+            messages[index].streaming = false
+            changed = true
+        }
+        streamingID = nil
+        if changed { cacheCurrentIfLoaded() }
     }
 
     /// Collapse the leftovers of an interrupted stream once the session is known
@@ -425,9 +465,18 @@ final class WidgetModel: ObservableObject {
         // A streaming bubble is authoritative for its step: merging a history
         // copy into it mid-stream either duplicates the text (history first,
         // deltas after) or closes the bubble early. Wait until the stream ends.
-        guard !hasStreamingBubble else {
-            WidgetLog.event("tail-sync-skip", "reason=\(reason) streaming=true")
-            return
+        if hasStreamingBubble {
+            // A bubble orphaned by a lost end frame used to block this forever:
+            // every tail sync skipped, so the text never settled and the widget
+            // stayed "thinking". Once the stream has been quiet long enough the
+            // stale part is the flag, not the text.
+            let quiet = Date().timeIntervalSince(lastStreamAt)
+            if quiet < 3 {
+                WidgetLog.event("tail-sync-skip", "reason=\(reason) streaming=true quiet=\(Int(quiet * 1000))ms")
+                return
+            }
+            WidgetLog.event("tail-sync", "reason=\(reason) stale-streaming quiet=\(Int(quiet * 1000))ms")
+            clearStreamingFlags()
         }
         guard let client,
               let id = selectedSessionID,
@@ -511,15 +560,16 @@ final class WidgetModel: ObservableObject {
 
     func selectSession(_ id: String) {
         guard selectedSessionID != id else { return }
-        if let current = selectedSessionID, fullHistoryLoaded.contains(current) {
-            fullHistoryCache[current] = messages
-        }
+        cacheCurrentIfLoaded()
         selectedSessionID = id
         saveSelection(id)
         messages = []
         activity = ThinkingActivity()
         errorText = nil
         syncStatus = nil
+        hasEarlier = false
+        isLoadingEarlier = false
+        earliestSeq = nil
         isSyncingHistory = false
         isLoadingHistory = true
         isRunning = sessions.first(where: { $0.id == id })?.running ?? false
@@ -537,44 +587,78 @@ final class WidgetModel: ObservableObject {
         historyTask?.cancel()
         guard let client else { return }
         if let cached = fullHistoryCache[id] {
-            applyHistory(cached)
+            hasEarlier = cached.hasEarlier
+            earliestSeq = cached.earliestSeq
+            applyHistory(cached.messages)
             isLoadingHistory = false
             return
         }
         isLoadingHistory = true
         historyTask = Task { [weak self] in
             do {
-                let page = try await client.history(sessionId: id, all: true)
+                // One recent page, not the whole transcript. Importing 500+
+                // bubbles up front is what made opening an old session crawl.
+                let page = try await client.history(sessionId: id, limit: Self.historyPageSize)
                 guard !Task.isCancelled, let self, self.selectedSessionID == id else { return }
-                // Only a response that reached the oldest event is a complete
-                // transcript. A 200-page guard stop still has hasMore=true and
-                // must not be cached as "everything".
-                if page.oldestSeq != nil && !page.hasMore {
-                    self.storeFullHistory(page.messages, for: id)
-                }
+                self.hasEarlier = page.hasMore && page.oldestSeq != nil
+                self.earliestSeq = page.oldestSeq
                 self.applyHistory(page.messages)
                 self.isLoadingHistory = false
                 if page.hasMore {
                     self.setSyncStatus("已载入最近 \(page.messages.count) 条")
                 }
+                WidgetLog.event(
+                    "history",
+                    "in=\(page.messages.count) hasMore=\(page.hasMore) oldest=\(page.oldestSeq ?? -1)"
+                )
             } catch {
                 guard !Task.isCancelled, let self, self.selectedSessionID == id else { return }
-                // A full import can hit the host's page guard or a timeout.
-                // Fall back to the recent window instead of an empty widget.
-                do {
-                    let fallback = try await client.history(sessionId: id)
-                    guard !Task.isCancelled, self.selectedSessionID == id else { return }
-                    self.applyHistory(fallback.messages)
-                    self.isLoadingHistory = false
-                    self.errorText = "全量历史加载失败，已显示最近 \(fallback.messages.count) 条"
-                    self.setSyncStatus("全量加载失败")
-                } catch {
-                    guard !Task.isCancelled, self.selectedSessionID == id else { return }
-                    self.isLoadingHistory = false
-                    if self.messages.isEmpty {
-                        self.errorText = "历史加载失败：" + error.localizedDescription
-                    }
+                self.isLoadingHistory = false
+                if self.messages.isEmpty {
+                    self.errorText = "历史加载失败：" + error.localizedDescription
                 }
+            }
+        }
+    }
+
+    /// Fetch the page just above the current window. Paging keeps a 500+ turn
+    /// session cheap to open: the transcript only grows while the reader keeps
+    /// asking for what came before.
+    func loadEarlier() {
+        guard let client,
+              let id = selectedSessionID,
+              hasEarlier,
+              !isLoadingEarlier,
+              !isLoadingHistory,
+              let before = earliestSeq else { return }
+        isLoadingEarlier = true
+        Task { [weak self] in
+            do {
+                let page = try await client.history(sessionId: id, limit: Self.historyPageSize, before: before)
+                guard let self, self.selectedSessionID == id else { return }
+                if let oldest = page.oldestSeq {
+                    self.earliestSeq = oldest
+                    self.hasEarlier = page.hasMore
+                } else {
+                    self.hasEarlier = false
+                }
+                let previous = self.messages.count
+                let merged = Transcript.prepending(page.messages, to: self.messages)
+                if merged.count != previous {
+                    // Inserting above the viewport keeps the reader where they
+                    // were, so no scroll nudge here.
+                    self.messages = merged
+                    self.cacheCurrentIfLoaded()
+                }
+                self.isLoadingEarlier = false
+                WidgetLog.event(
+                    "load-earlier",
+                    "in=\(page.messages.count) added=\(self.messages.count - previous) total=\(self.messages.count) hasMore=\(page.hasMore)"
+                )
+            } catch {
+                guard let self, self.selectedSessionID == id else { return }
+                self.isLoadingEarlier = false
+                self.errorText = "更早的消息加载失败：" + error.localizedDescription
             }
         }
     }
@@ -582,16 +666,18 @@ final class WidgetModel: ObservableObject {
     private func applyHistory(_ history: [ChatMessage]) {
         guard !history.isEmpty else { return }
         let known = Set(history.map(\.id))
+        let knownSteps = Set(history.compactMap { message -> String? in
+            guard message.role == "assistant", let turn = message.turn, let step = message.step else { return nil }
+            return "\(turn)|\(step)"
+        })
         // Keep an in-flight optimistic user bubble or streaming reply that the
         // history endpoint does not know about yet. If history already carries
         // the final reply for the same turn/step, drop the streaming copy so
         // the transcript does not show it twice.
         let live = messages.filter { message in
             guard (message.pending || message.streaming), !known.contains(message.id) else { return false }
-            if message.role == "assistant", message.turn != nil || message.step != nil {
-                if history.contains(where: {
-                    $0.role == "assistant" && $0.turn == message.turn && $0.step == message.step
-                }) { return false }
+            if message.role == "assistant", let turn = message.turn, let step = message.step {
+                return !knownSteps.contains("\(turn)|\(step)")
             }
             return true
         }
@@ -700,15 +786,13 @@ final class WidgetModel: ObservableObject {
         case .assistantEnd:
             WidgetLog.event("stream-end", "count=\(messages.count) streaming=\(streamingID?.prefix(8) ?? "nil")")
             if let id = selectedSessionID { liveRunningIDs.remove(id) }
-            if let streamingID, let index = messages.firstIndex(where: { $0.id == streamingID }) {
-                messages[index].streaming = false
-            }
+            clearStreamingFlags()
             messages.removeAll { $0.role == "assistant" && $0.text.isEmpty }
             messages = Transcript.deduped(messages)
             cacheCurrentIfLoaded()
-            streamingID = nil
         case .turnEnd:
             withAnimation(.easeOut(duration: 0.45)) { activity.finish(at: Date()) }
+            clearStreamingFlags()
             idleTicks = 0
             isRunning = false
         case .serverError(let message):
@@ -819,11 +903,11 @@ final class WidgetModel: ObservableObject {
                 let page = try await client.history(sessionId: id, all: full, after: after)
                 guard !Task.isCancelled, let self, self.selectedSessionID == id else { return }
                 let added = self.mergeSynced(page.messages)
-                if full && page.oldestSeq != nil && !page.hasMore {
-                    self.storeFullHistory(self.messages, for: id)
-                } else {
-                    self.cacheCurrentIfLoaded()
+                if full {
+                    self.hasEarlier = page.hasMore && page.oldestSeq != nil
+                    self.earliestSeq = page.oldestSeq
                 }
+                self.cacheCurrentIfLoaded()
                 self.isSyncingHistory = false
                 self.setSyncStatus(added == 0 ? "已是最新" : "已同步 \(added) 条")
             } catch {
@@ -845,21 +929,18 @@ final class WidgetModel: ObservableObject {
         return result.added
     }
 
-    private func storeFullHistory(_ history: [ChatMessage], for id: String) {
-        fullHistoryCache[id] = history
-        fullHistoryLoaded.insert(id)
+    /// Remember the window on screen for this session, paging state included.
+    /// An empty transcript is not cached: it usually means the fetch has not
+    /// landed yet, and caching it would show a blank panel on the next switch.
+    private func cacheCurrentIfLoaded() {
+        guard let id = selectedSessionID, !messages.isEmpty else { return }
+        fullHistoryCache[id] = CachedTranscript(messages: messages, hasEarlier: hasEarlier, earliestSeq: earliestSeq)
         fullHistoryOrder.removeAll { $0 == id }
         fullHistoryOrder.append(id)
         while fullHistoryOrder.count > 3 {
             let evicted = fullHistoryOrder.removeFirst()
             fullHistoryCache.removeValue(forKey: evicted)
-            fullHistoryLoaded.remove(evicted)
         }
-    }
-
-    private func cacheCurrentIfLoaded() {
-        guard let id = selectedSessionID, fullHistoryLoaded.contains(id) else { return }
-        fullHistoryCache[id] = messages
     }
 
     private func setSyncStatus(_ text: String) {

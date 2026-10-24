@@ -1015,11 +1015,17 @@ export class WidgetBridge {
           });
           return;
         }
-        const snapshot = await this.readSnapshot(sessionId, limit);
+        // A bare page request is the widget's first paint: the most recent
+        // window plus the sequence bounds, so the client can tell "window" from
+        // "everything" and ask for the page above it.
+        const window = await this.readWindow(sessionId, limit);
+        const pageSeqs = window.messages.map((message) => message.seq).filter(Number.isSafeInteger);
         json(res, 200, {
           sessionId,
-          messages: messagesFromSnapshot(snapshot),
-          hasMore: snapshot?.hasMore === true,
+          messages: window.messages,
+          hasMore: window.hasMore,
+          oldestSeq: pageSeqs.length ? Math.min(...pageSeqs) : null,
+          newestSeq: pageSeqs.length ? Math.max(...pageSeqs) : null,
         });
         return;
       }
@@ -1158,6 +1164,44 @@ export class WidgetBridge {
   async readSnapshot(sessionId, limit) {
     const snapshot = await this.readTailSnapshot(sessionId, limit);
     return this.expandSnapshot(sessionId, snapshot, limit, undefined);
+  }
+
+  /**
+   * The widget's first paint: roughly the last `limit` messages, walking back
+   * from the tail. Reading the tail snapshot alone returned a handful of
+   * bubbles, so the window has to fill itself before it is served.
+   */
+  async readWindow(sessionId, limit) {
+    const controller = this.requireController();
+    const pageSignal = new AbortController().signal;
+    const snapshot = await this.readTailSnapshot(sessionId, limit);
+    let records = Array.isArray(snapshot?.records) ? snapshot.records.slice() : [];
+    let messages = messagesFromSnapshot({ records });
+    let hasMore = snapshot?.hasMore === true;
+    const seen = new Set(records.map((record) => record?.event?.seq).filter(Number.isSafeInteger));
+    for (let page = 0; page < HISTORY_ALL_PAGE_GUARD && hasMore && messages.length < limit; page += 1) {
+      const seqs = records.map((record) => record?.event?.seq).filter(Number.isSafeInteger);
+      if (seqs.length === 0) break;
+      const oldestSeq = Math.min(...seqs);
+      if (oldestSeq <= 0) break;
+      const older = await controller.page({
+        address: { kind: "session", sessionId },
+        throughSeq: snapshot.cursor,
+        beforeSeq: oldestSeq,
+        maxMessages: limit,
+        turnWindow: turnWindowFor(limit),
+      }, pageSignal);
+      const fresh = (Array.isArray(older?.records) ? older.records : []).filter((record) => {
+        const seq = record?.event?.seq;
+        return Number.isSafeInteger(seq) && !seen.has(seq);
+      });
+      if (fresh.length === 0) break;
+      for (const record of fresh) seen.add(record?.event?.seq);
+      records = [...fresh, ...records];
+      messages = messagesFromSnapshot({ records });
+      hasMore = older?.hasMore === true;
+    }
+    return { messages, hasMore };
   }
 
   /**

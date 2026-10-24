@@ -94,12 +94,24 @@ final class BridgeClient {
         return response.sessions
     }
 
-    func history(sessionId: String, limit: Int = 500, all: Bool = false, after: Int? = nil) async throws -> HistoryResponse {
+    /// before asks for the page above the oldest message on screen; the host
+    /// pages backwards by sequence, so a windowed transcript can grow on demand.
+    func history(
+        sessionId: String,
+        limit: Int = 500,
+        all: Bool = false,
+        after: Int? = nil,
+        before: Int? = nil
+    ) async throws -> HistoryResponse {
         var components = URLComponents(url: sessionURL(sessionId, "history"), resolvingAgainstBaseURL: false)!
         var items = [URLQueryItem(name: "limit", value: String(limit))]
         if let after {
             items.append(URLQueryItem(name: "after", value: String(after)))
-        } else if all {
+        }
+        if let before {
+            items.append(URLQueryItem(name: "before", value: String(before)))
+        }
+        if all && after == nil && before == nil {
             items.append(URLQueryItem(name: "all", value: "1"))
         }
         components.queryItems = items

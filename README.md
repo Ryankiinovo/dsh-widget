@@ -18,7 +18,7 @@ A macOS desktop widget for the DeepSeek Harness desktop app: keep the current se
 - Resides at the desktop window level: below normal app windows, above the wallpaper.
 - Lists sessions in the current workspace and switches between them.
 - Sends prompts and renders streaming assistant replies. The composer supports multiple lines: **Enter sends, Shift+Enter inserts a newline**.
-- Loads full session history (paged) and keeps a local cache; a sync button fills gaps after disconnects.
+- Opens a session with a ~200-message window and loads older pages on demand ("Load earlier"); keeps a local cache, and a sync button fills gaps after disconnects.
 - Supports basic Markdown: paragraphs, headings, lists, quotes, rules, code blocks, bold/italic/inline code and links.
 - Shows a workspace menu and can create a new session in the current workspace.
 - While the agent runs, a status row stays at the end of the session: breathing lamp (green = thinking/writing, blue = running a tool, yellow = waiting or error), action name, elapsed timer, step number, a tick strip, the last three reasoning segments, and a trace of the last three tool calls.
@@ -135,7 +135,7 @@ The bridge does not duplicate DSH business logic; it exposes existing session ca
 - Markdown is a basic subset; tables, raw HTML and deeply nested structures are not rendered.
 - Desktop window level: full-screen apps cover the widget by design.
 - No protocol version negotiation; a future DSH release may change the plugin API.
-- Full history is capped at 200 pages; the UI reports when more remains.
+- A session opens with a ~200-message window; older pages load on demand. Full imports (`?all=1`) are capped at 200 pages.
 - Cloudflare quick tunnels buffer `text/event-stream` bodies for roughly 40–50 seconds. On cellular the client falls back to polling: history and prompts work, but the live "thinking" status row does not. For reliable streaming, use a self-hosted tunnel (frp + Caddy or a Cloudflare named tunnel).
 
 ## License

@@ -15,7 +15,7 @@ struct MarkdownMessageText: View {
     var fillWidth: Bool = true
 
     private var blocks: [MarkdownBlock] {
-        MarkdownBlock.parse(text)
+        MarkdownCache.blocks(for: text)
     }
 
     var body: some View {
@@ -147,6 +147,31 @@ private struct InlineMarkdownText: View {
             value[run.range].font = font
         }
         return value
+    }
+}
+
+/// Parsing is memoised. Every stream frame re-renders the transcript, so a
+/// long session re-parsed the full Markdown of every finished bubble dozens of
+/// times per second. Keyed by the whole string (not a hash) so a cache hit can
+/// never show the wrong answer.
+private enum MarkdownCache {
+    private final class Entry {
+        let blocks: [MarkdownBlock]
+        init(_ blocks: [MarkdownBlock]) { self.blocks = blocks }
+    }
+
+    private static let storage: NSCache<NSString, Entry> = {
+        let cache = NSCache<NSString, Entry>()
+        cache.countLimit = 400
+        return cache
+    }()
+
+    static func blocks(for text: String) -> [MarkdownBlock] {
+        let key = text as NSString
+        if let hit = storage.object(forKey: key) { return hit.blocks }
+        let parsed = MarkdownBlock.parse(text)
+        storage.setObject(Entry(parsed), forKey: key)
+        return parsed
     }
 }
 

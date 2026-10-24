@@ -4,6 +4,13 @@ import Foundation
 /// Everything here is a function of the message arrays only, so it can be
 /// exercised without a bridge, a window or a running DSH.
 enum Transcript {
+    /// How many trailing messages the text-similarity fallback scans. A full
+    /// scan made folding one history page into a 500+ bubble transcript
+    /// quadratic: every page compared each reply against every reply already
+    /// on screen. Matching now goes through a one-pass index and only the
+    /// replies that carry neither an id nor a seq ever reach the text pass.
+    static let similarScanLimit = 80
+
     /// DSH can deliver the same assistant step twice: once from /history and
     /// once from the live stream, especially when a reconnect or a slow
     /// history request overlaps streaming. Keep one bubble per turn/step.
@@ -39,15 +46,16 @@ enum Transcript {
     static func mergingSnapshot(into existing: [ChatMessage], snapshot: [ChatMessage]) -> [ChatMessage] {
         guard !snapshot.isEmpty else { return existing }
         guard !existing.isEmpty else { return deduped(snapshot) }
-        var result = existing
+        var matcher = Matcher(existing)
         for message in snapshot {
-            if let index = matchIndex(for: message, in: result) {
-                merge(message, at: index, in: &result)
+            if let index = matcher.match(message) {
+                merge(message, at: index, in: &matcher.items)
+                matcher.reindex(index)
             } else {
-                result.append(message)
+                matcher.append(message)
             }
         }
-        return deduped(result)
+        return deduped(matcher.items)
     }
 
     /// Drop the leftovers of an interrupted stream: empty assistant bubbles and
@@ -72,76 +80,72 @@ enum Transcript {
     /// transcript plus how many bubbles were added or refreshed.
     static func addingSynced(to existing: [ChatMessage], history: [ChatMessage]) -> (messages: [ChatMessage], added: Int) {
         guard !history.isEmpty else { return (existing, 0) }
-        var result = existing
-        let knownIDs = Set(result.map(\.id))
-        let knownSeq = Set(result.compactMap(\.seq))
-        let knownText = Set(result.map { "\($0.role)|\($0.text)" })
+        var matcher = Matcher(existing)
         var added = 0
         for message in history {
-            if !message.id.isEmpty && knownIDs.contains(message.id) { continue }
-            if let seq = message.seq, knownSeq.contains(seq) { continue }
-            if message.seq == nil && knownText.contains("\(message.role)|\(message.text)") { continue }
-            if let index = matchIndex(for: message, in: result) {
-                if merge(message, at: index, in: &result) { added += 1 }
+            if matcher.isKnown(message) { continue }
+            if let index = matcher.match(message) {
+                if merge(message, at: index, in: &matcher.items) { added += 1 }
+                matcher.reindex(index)
                 continue
             }
-            result.append(message)
+            matcher.append(message)
             added += 1
         }
-        return (deduped(result), added)
+        return (deduped(matcher.items), added)
     }
 
-    private static func matchIndex(for message: ChatMessage, in list: [ChatMessage]) -> Int? {
-        if !message.id.isEmpty,
-           let index = list.firstIndex(where: { $0.role == message.role && $0.id == message.id }) {
-            return index
+    /// Put an older page in front of the transcript on screen. The on-screen
+    /// copy wins for anything already there: it may carry a newer reply for the
+    /// same turn/step than the page that was just fetched.
+    static func prepending(_ older: [ChatMessage], to existing: [ChatMessage]) -> [ChatMessage] {
+        guard !existing.isEmpty else { return deduped(older) }
+        guard !older.isEmpty else { return existing }
+        let knownIDs = Set(existing.map(\.id))
+        let knownSeq = Set(existing.compactMap(\.seq))
+        let kept = older.filter { message in
+            if !message.id.isEmpty && knownIDs.contains(message.id) { return false }
+            if let seq = message.seq, knownSeq.contains(seq) { return false }
+            return true
         }
-        if let seq = message.seq,
-           let index = list.firstIndex(where: { $0.role == message.role && $0.seq == seq }) {
-            return index
-        }
-        // A history reply carries turn/step while the streaming bubble it should
-        // fold into may not (delta frames have neither), so fall through to text
-        // similarity instead of giving up when the step lookup misses.
-        if message.role == "assistant", message.turn != nil || message.step != nil {
-            if let index = list.firstIndex(where: {
-                $0.role == "assistant" && $0.turn == message.turn && $0.step == message.step
-            }) { return index }
-        }
-        if message.role == "user" {
-            return list.lastIndex(where: {
-                $0.role == "user" && $0.pending && $0.text == message.text
-            })
-        }
-        if message.role == "assistant" {
-            return similarAssistantIndex(message, in: list)
-        }
-        return nil
+        guard !kept.isEmpty else { return existing }
+        return deduped(kept + existing)
+    }
+
+    /// Text-similarity fallback for one reply. Exposed for the unit tests and
+    /// for callers that need to ask about a single bubble.
+    static func similarAssistantIndex(_ message: ChatMessage, in list: [ChatMessage]) -> Int? {
+        similarIndex(message, in: list)
     }
 
     /// One reply can reach the widget twice with no shared turn/step or id:
     /// /history and the live stream label the same step differently, and a
     /// reconnect can replay it. Fall back to text similarity so a single answer
     /// never splits into two bubbles with a duplicated paragraph.
-    static func similarAssistantIndex(_ message: ChatMessage, in list: [ChatMessage]) -> Int? {
+    private static func similarIndex(_ message: ChatMessage, in list: [ChatMessage]) -> Int? {
         guard message.role == "assistant" else { return nil }
         let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.count >= 40 else { return nil }
-        return list.lastIndex { candidate in
-            guard candidate.role == "assistant" else { return false }
+        let floor = max(0, list.count - similarScanLimit)
+        var index = list.count - 1
+        while index >= floor {
+            defer { index -= 1 }
+            let candidate = list[index]
+            guard candidate.role == "assistant" else { continue }
             let other = candidate.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard other.count >= 40 else { return false }
-            if other == text { return true }
+            guard other.count >= 40 else { continue }
+            if other == text { return index }
             let shorter = other.count <= text.count ? other : text
             let longer = other.count <= text.count ? text : other
-            guard longer.contains(shorter) else { return false }
-            if Double(shorter.count) / Double(longer.count) > 0.8 { return true }
+            guard longer.contains(shorter) else { continue }
+            if Double(shorter.count) / Double(longer.count) > 0.8 { return index }
             // A stream that attached late only carries the tail of the reply:
             // the partial bubble is a suffix of the authoritative text. Merge
             // those as well, otherwise the tail stays behind as a second
             // bubble after the full reply arrives from /history.
-            return shorter.count >= 40 && longer.hasSuffix(shorter)
+            if shorter.count >= 40 && longer.hasSuffix(shorter) { return index }
         }
+        return nil
     }
 
     /// Merge one authoritative message into an existing bubble. Returns whether
@@ -161,5 +165,77 @@ enum Transcript {
         if let turn = message.turn, list[index].turn != turn { list[index].turn = turn }
         if let step = message.step, list[index].step != step { list[index].step = step }
         return changed
+    }
+
+    /// One-pass index over a transcript. Built once per fold instead of
+    /// scanning the whole array for every incoming message.
+    private struct Matcher {
+        var items: [ChatMessage]
+        private var byID: [String: Int] = [:]
+        private var bySeq: [String: Int] = [:]
+        private var byStep: [String: Int] = [:]
+        private var byPendingUser: [String: Int] = [:]
+        private var byText: [String: Int] = [:]
+
+        init(_ items: [ChatMessage]) {
+            self.items = items
+            for (index, message) in items.enumerated() { register(index, message) }
+        }
+
+        private static func idKey(_ message: ChatMessage) -> String? {
+            message.id.isEmpty ? nil : message.role + "|" + message.id
+        }
+
+        private static func seqKey(_ message: ChatMessage) -> String? {
+            message.seq.map { message.role + "|" + String($0) }
+        }
+
+        private static func stepKey(_ message: ChatMessage) -> String? {
+            guard message.role == "assistant", let turn = message.turn, let step = message.step else { return nil }
+            return String(turn) + "|" + String(step)
+        }
+
+        private static func textKey(_ message: ChatMessage) -> String? {
+            guard message.seq == nil, !message.text.isEmpty else { return nil }
+            return message.role + "|" + message.text
+        }
+
+        private mutating func register(_ index: Int, _ message: ChatMessage) {
+            if let key = Self.idKey(message), byID[key] == nil { byID[key] = index }
+            if let key = Self.seqKey(message), bySeq[key] == nil { bySeq[key] = index }
+            if let key = Self.stepKey(message), byStep[key] == nil { byStep[key] = index }
+            if let key = Self.textKey(message), byText[key] == nil { byText[key] = index }
+            if message.role == "user", message.pending { byPendingUser[message.text] = index }
+        }
+
+        mutating func append(_ message: ChatMessage) {
+            items.append(message)
+            register(items.count - 1, message)
+        }
+
+        /// A merged bubble can gain an id/seq/turn/step; index the new keys too
+        /// so a later page still folds into the same bubble.
+        mutating func reindex(_ index: Int) {
+            guard items.indices.contains(index) else { return }
+            register(index, items[index])
+        }
+
+        func isKnown(_ message: ChatMessage) -> Bool {
+            if let key = Self.idKey(message), byID[key] != nil { return true }
+            if let key = Self.seqKey(message), bySeq[key] != nil { return true }
+            if let key = Self.textKey(message), byText[key] != nil { return true }
+            return false
+        }
+
+        func match(_ message: ChatMessage) -> Int? {
+            if let key = Self.idKey(message), let index = byID[key] { return index }
+            if let key = Self.seqKey(message), let index = bySeq[key] { return index }
+            if let key = Self.stepKey(message), let index = byStep[key] { return index }
+            if message.role == "user", let index = byPendingUser[message.text] { return index }
+            if message.role == "assistant" {
+                return Transcript.similarIndex(message, in: items)
+            }
+            return nil
+        }
     }
 }
