@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WidgetBridge, apply } from "./index.js";
+import { attachPanel } from "./panel.js";
 
 const dir = mkdtempSync(join(tmpdir(), "dsh-widget-bridge-"));
 const discoveryPath = join(dir, "bridge.json");
@@ -24,12 +25,35 @@ const olderEvent = {
 
 let lastCreateRequest = null;
 let lastPromptContent = null;
+// Flipped by the /v1/workspaces assertion: a workspace row must count the
+// sessions with a turn in flight, otherwise the phone's lamp never lights.
+const runningSessions = new Set();
 const controller = {
   async list() {
     return {
       items: [
-        { sessionId: "session-abc", cwd: "/tmp/project", updatedAt: 123, running: false, blank: false },
-        { sessionId: "session-orphan", cwd: "/tmp/other", updatedAt: 120, running: false, blank: false },
+        {
+          sessionId: "session-abc",
+          cwd: "/tmp/project",
+          updatedAt: 123,
+          running: runningSessions.has("session-abc"),
+          blank: false,
+        },
+        {
+          sessionId: "session-orphan",
+          cwd: "/tmp/other",
+          updatedAt: 120,
+          running: runningSessions.has("session-orphan"),
+          blank: false,
+        },
+        {
+          // 0 消息的空会话：手机端每新建一条就留一个，列表里默认不出现。
+          sessionId: "session-blank",
+          cwd: "/tmp/blank-only",
+          updatedAt: 121,
+          running: false,
+          blank: true,
+        },
       ],
     };
   },
@@ -177,6 +201,34 @@ try {
   assert.equal(list.status, 200);
   const listed = await list.json();
   assert.equal(listed.sessions[0].id, "session-abc");
+  // 空会话默认隐藏，点开只有一页白；排查时仍可显式要看。
+  assert.equal(listed.sessions.some((session) => session.id === "session-blank"), false);
+  assert.equal("endedAt" in listed.sessions[0], true);
+  const withBlank = await fetch(
+    "http://127.0.0.1:" + discovery.port + "/v1/sessions?includeBlank=1",
+    { headers },
+  );
+  const blankBody = await withBlank.json();
+  assert.equal(blankBody.sessions.some((session) => session.id === "session-blank"), true);
+  // 看过之后，bridge 也要忘掉这条未读，否则 App 重启会重新点亮。
+  const read = await fetch(
+    "http://127.0.0.1:" + discovery.port + "/v1/sessions/session-abc/read",
+    { method: "POST", headers },
+  );
+  assert.equal(read.status, 200);
+
+  // The workspace row answers "is anything of mine running?" on its own.
+  // Reading row.id instead of row.sessionId counted nothing and looked correct
+  // from the phone (all lamps off), so pin the number here.
+  runningSessions.add("session-abc");
+  const workspacesRunning = await fetch("http://127.0.0.1:" + discovery.port + "/v1/workspaces", { headers });
+  assert.equal(workspacesRunning.status, 200);
+  const wsBody = await workspacesRunning.json();
+  assert.equal(wsBody.workspaces.find((workspace) => workspace.id === "ws-1").runningCount, 1);
+  assert.equal(wsBody.workspaces.find((workspace) => workspace.id === "ws-2").runningCount, 0);
+  runningSessions.delete("session-abc");
+  const workspacesIdle = await fetch("http://127.0.0.1:" + discovery.port + "/v1/workspaces", { headers });
+  assert.equal((await workspacesIdle.json()).workspaces.find((w) => w.id === "ws-1").runningCount, 0);
 
   // A cwd-only create leaves a session ungrouped. Startup reconciliation must
   // attach every such session to the Workspace that owns its cwd.
@@ -491,4 +543,112 @@ try {
 } finally {
   await limitBridge.stop();
   rmSync(limitDir, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// Settings panel: the Host routes must report bridge state, refuse non-POST
+// verbs on the actions, respect the Host's request fence, and hand the page a
+// pairing ticket plus a scannable SVG.
+const panelDir = mkdtempSync(join(tmpdir(), "dsh-widget-panel-"));
+const panelBridge = new WidgetBridge({
+  controller,
+  registry,
+  port: 0,
+  token,
+  discoveryPath: join(panelDir, "bridge.json"),
+  devicesPath: join(panelDir, "devices.json"),
+  auditPath: join(panelDir, "audit.log"),
+});
+await panelBridge.start();
+const routes = new Map();
+const webServer = {
+  register(route) {
+    routes.set(route.path, route.handler);
+    return () => routes.delete(route.path);
+  },
+};
+let rejectWith;
+const connection = {
+  requestRejection() {
+    return rejectWith;
+  },
+};
+const panelScope = {
+  get(name) {
+    if (name === "webServer") return webServer;
+    if (name === "connection") return connection;
+    return undefined;
+  },
+};
+const panelDispose = attachPanel(panelBridge, panelScope, (message) => {
+  throw new Error(message);
+});
+
+async function callPanel(method, path, { rejected } = {}) {
+  const handler = routes.get("/widget-panel" + path);
+  assert.equal(typeof handler, "function", "route missing: " + path);
+  const chunks = [];
+  const res = {
+    statusCode: 200,
+    headers: {},
+    setHeader(name, value) {
+      this.headers[name.toLowerCase()] = value;
+    },
+    end(chunk) {
+      if (chunk !== undefined) chunks.push(Buffer.from(chunk));
+    },
+  };
+  rejectWith = rejected;
+  await handler({ method, headers: {} }, res);
+  rejectWith = undefined;
+  const text = Buffer.concat(chunks).toString("utf8");
+  return { status: res.statusCode, headers: res.headers, body: text === "" ? undefined : JSON.parse(text) };
+}
+
+try {
+  const status = await callPanel("GET", "/status");
+  assert.equal(status.status, 200);
+  assert.equal(typeof status.body.app.running, "boolean");
+  assert.equal(typeof status.body.checkedAt, "string");
+  // The panel advertises exactly the addresses a pairing code would carry.
+  assert.ok(status.body.addresses !== null && typeof status.body.addresses === "object", "status must report addresses");
+  assert.ok(status.body.addresses.lan === null || typeof status.body.addresses.lan === "string");
+  assert.ok(status.body.addresses.public === null || typeof status.body.addresses.public === "string");
+  const ticketAddrs = panelBridge.pairCandidates();
+  if (ticketAddrs.length > 0) assert.ok(ticketAddrs.includes(status.body.addresses.lan) || status.body.addresses.lan === null);
+
+  // Quitting is deliberately not a panel action any more.
+  const noQuit = routes.get("/widget-panel/app/quit");
+  assert.equal(noQuit, undefined, "app/quit must not be registered");
+
+  // The Host request fence runs before any probe: a rejected request must not
+  // answer with state.
+  const fenced = await callPanel("GET", "/status", { rejected: 403 });
+  assert.equal(fenced.status, 403);
+  assert.equal(fenced.body, undefined);
+
+  // Actions are POST only, and say so.
+  const wrongVerb = await callPanel("GET", "/pair");
+  assert.equal(wrongVerb.status, 405);
+  assert.equal(wrongVerb.headers.allow, "POST");
+
+  const pair = await callPanel("POST", "/pair");
+  assert.equal(pair.status, 200);
+  assert.equal(pair.body.ok, true);
+  assert.match(pair.body.code, /^\d{6}$/u);
+  assert.match(pair.body.uri, /^dshwidget:\/\/pair\?v=1&/u);
+  assert.ok(pair.body.qrSvg.startsWith("<svg"), "panel must answer with a QR SVG");
+  assert.ok(pair.body.addrs.length >= 1);
+  assert.equal(panelBridge.pairing.active, true);
+
+  // One live ticket at a time: a second press replaces the first code.
+  const second = await callPanel("POST", "/pair");
+  assert.equal(second.status, 200);
+  assert.notEqual(second.body.code, pair.body.code);
+  assert.equal(panelBridge.pairing.active, true);
+  console.log("settings panel test passed");
+} finally {
+  panelDispose();
+  await panelBridge.stop();
+  rmSync(panelDir, { recursive: true, force: true });
 }

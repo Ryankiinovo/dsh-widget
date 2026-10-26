@@ -5,6 +5,32 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-26
+
+### Added
+
+- **DSH 设置页新增「Widget」一栏**（`src/bridge/panel.js` + `src/bridge/client.js`）：一行 `DSHWidget.app` 状态（未运行时给「启动」按钮，点了直接用 `open -b` 拉起），下面是「生成配对码」——点一下就地生成二维码、6 位码与 120 秒倒计时，过期显示「已过期」并给「刷新」，不自动重发；码下方一行显示二维码里带的地址（局域网 · 公网），公网不通时标「公网未连接」，不至于扫了才发现连不上。
+- 二维码由 `src/bridge/qr.js` 现场编码（byte 模式、ECC M、版本 1–10、单 path SVG），不引第三方依赖——本机没有 `qrencode`，宿主也不是浏览器环境，图标库里没有现成的编码器；版本 1–10 全部用 Vision 解码验过。
+- 宿主侧路由 `GET /widget-panel/status`、`POST /widget-panel/app/launch`、`POST /widget-panel/pair`：每条 handler 先过 `connection.requestRejection`，POST 只收 `application/json` 且 body 上限 16 KiB。
+- `package.json` 补 `exports['./client']` 与 `dsh.client`，宿主按 `dsh.client` 自动发现浏览器半边并注册 `settings.section`（id `desktop-widget`，order 35）；`cordis.patch.yml` 不用动。
+- `WidgetBridge.pairingTicket()`：把「开票 + 候选地址 + URI」收成一处，`POST /v1/pair/start` 与设置页面板共用，审计照记。
+
+### Changed
+
+- 设置页那一栏只做「配对」与「启动 App」，不提供退出 App、也不提供隧道开关：DSH Web 只监听 127.0.0.1，这一栏只能在 Mac 本机打开，出门在外的场景本来就够不到它。隧道与退出的控制留在 Mac App 里。
+
+## [0.6.0] - 2026-10-26
+
+### Added
+
+- `GET /v1/sessions` 默认隐藏 0 消息的空会话（`blank: true`，`?includeBlank=1` 保留全部），未分组列表与 `GET /v1/workspaces` 的 `sessionCount`/`runningCount` 同步剔除。起因：手机列表 68 条里 59 条是空会话，AI-Work 显示 11 条点开只有 5 条有内容——都是「首页点一下就新建」留下的壳。
+- 未读黄灯改由 bridge 兜底：bridge 每 5 秒观察一次运行状态，把「在跑 → 不跑」记成 `endedAt`（ms），`GET /v1/sessions` 每行带上该字段；新增 `POST /v1/sessions/{id}/read` 供手机清灯。起因：App 被系统回收后重启会丢本地基线，那一次翻转就补不回来。
+- `GET /v1/sessions` 默认隐藏 subagent 会话（`origin: "subagent"`，`?includeSubagents=1` 保留全部），未分组列表与 `GET /v1/workspaces` 的 `sessionCount`/`runningCount` 同步剔除。起因：手机工作区里出现一批电脑上找不到、点开就 409 的会话——它们是 subagent 委派会话（history 报 `subagent Sessions require their durable parent address`），而 `normalizeSession` 当时把 `origin`/`parentSessionId` 丢了，客户端无法区分。
+
+### Fixed
+
+- `GET /v1/workspaces` 的 `runningCount` 恒为 0：`controller.list()` 的行只有 `sessionId` 没有 `id`，收集 running 集合时改取 `row.sessionId ?? row.id`；`test-mock.mjs` 补了 runningCount 的回归断言。
+
 ### Changed
 
 - 隧道日志不再写 `/tmp`，统一到 `~/Library/Logs/dshwidget/`：`cloudflared.log`（超过 5 MB 自动轮转为 `.1`）、`tunnel.out.log`、`tunnel.err.log`、`cloudflared.pid`；`install-launchd.sh` 重新安装时也会轮转旧文件。`/tmp` 重启即清空，放那里既留不住证据也看不出长期趋势。

@@ -175,6 +175,12 @@ cmd_run() {
   if [ -z "$url" ]; then say "60 秒内没拿到地址，等 launchd 重启（日志 ${LOG_FILE}）"; fi
 
   # bridge 换端口（DSH 重启）就自杀一次，交给 launchd 用新端口重建。
+  #
+  # 另一个失败模式：Cloudflare 会从它那侧回收 quick tunnel（日志里写
+  # "Tunnel not found"）。此时 cloudflared 进程还活着、kill -0 依然成功，
+  # 但公网永远连不上——只看进程存活会让手机在蜂窝下彻底失联。所以每约
+  # 60 秒探一次登记地址，连续两次不通就自杀，让 launchd 换一条新隧道。
+  local tick=0 bad=0 code
   while kill -0 "$pid" 2>/dev/null; do
     sleep 15
     last_port="$(resolve_port)"
@@ -183,6 +189,23 @@ cmd_run() {
       kill "$pid" 2>/dev/null || true
       break
     fi
+    tick=$((tick + 1))
+    if [ "${tick}" -lt 4 ]; then continue; fi
+    tick=0
+    url="$(cat "$URL_FILE" 2>/dev/null || true)"
+    if [ -z "$url" ]; then continue; fi
+    code="$(probe "$url")"
+    case "$code" in
+      200|401) bad=0 ;;
+      *)
+        bad=$((bad + 1))
+        say "公网探测 HTTP ${code}（连续第 ${bad} 次），隧道可能已被 Cloudflare 回收"
+        if [ "${bad}" -ge 2 ]; then
+          kill "$pid" 2>/dev/null || true
+          break
+        fi
+        ;;
+    esac
   done
   wait "$pid" 2>/dev/null || true
   say "cloudflared 已退出，最后登记地址：$(cat "$URL_FILE" 2>/dev/null || true)"

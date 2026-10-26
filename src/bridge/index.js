@@ -30,6 +30,7 @@ import {
   RateLimiter,
   safeEqual,
 } from "./security.js";
+import { attachPanel } from "./panel.js";
 
 const DEFAULT_DISCOVERY = join(homedir(), ".dsh", "widget-bridge.json");
 const DEFAULT_DEVICES = join(homedir(), ".dsh", "widget-devices.json");
@@ -296,6 +297,16 @@ function normalizeSession(row) {
     blank: row.blank === true,
     agentAvailable: row.agentAvailable === true,
     formatStatus: row.formatStatus ?? null,
+    // Delegated sessions belong to a parent turn and cannot be opened on the
+    // phone (their history answers 409), so the client must be able to tell
+    // them apart from ordinary ones.
+    origin: typeof row.origin === "string" ? row.origin : null,
+    parentSessionId:
+      typeof row.parentSessionId === "string"
+        ? row.parentSessionId
+        : typeof row.parentSession === "string"
+          ? row.parentSession
+          : null,
   };
 }
 
@@ -417,6 +428,11 @@ export class WidgetBridge {
     // sessionId → 这一轮正在产生的思考。DSH 只把 reasoning-delta 推给当时的
     // 订阅者，手机切后台/退会话错过就再也拿不回来；重连时先回放这一段。
     this.liveReasoning = new Map();
+    // sessionId → 上一轮观察到的 running。把「在跑 → 不跑」翻成一条未读，
+    // 手机被系统回收后重启时，这份记录是唯一还记得那次结束的地方。
+    this.runningSnapshot = new Map();
+    this.endedAt = new Map();
+    this.transitionTimer = null;
     this.server = createServer((req, res) => {
       void this.handle(req, res).catch((error) => {
         try {
@@ -493,6 +509,52 @@ export class WidgetBridge {
     return this.controller;
   }
 
+  /**
+   * 记录每个会话「从跑到不跑」的时刻。手机端自己也会翻转，但 App 被系统回收
+   * 后重启就丢了基线；这份由 bridge 常驻维护的记录是补灯的唯一来源。
+   * 子代理会话不参与：手机列表里根本不显示它们。
+   */
+  async trackRunningTransitions() {
+    if (!this.controller) return;
+    let rows;
+    try {
+      rows = await this.requireController().list({}, undefined);
+    } catch {
+      return;
+    }
+    const current = new Map();
+    for (const row of rows?.items ?? []) {
+      if (row?.origin === "subagent") continue;
+      // controller.list 的行用 sessionId，不是 id。
+      const id = String(row?.sessionId ?? row?.id);
+      current.set(id, row?.running === true);
+    }
+    const now = Date.now();
+    for (const [id, wasRunning] of this.runningSnapshot) {
+      if (wasRunning && current.get(id) === false) this.endedAt.set(id, now);
+    }
+    for (const [id, isRunning] of current) {
+      if (isRunning && this.endedAt.has(id)) this.endedAt.delete(id);
+    }
+    this.runningSnapshot = current;
+  }
+
+  startTransitionWatcher() {
+    if (this.transitionTimer) return;
+    void this.trackRunningTransitions();
+    this.transitionTimer = setInterval(() => {
+      void this.trackRunningTransitions();
+    }, 5000);
+    // 别让这个定时器拖住进程退出。
+    this.transitionTimer.unref?.();
+  }
+
+  stopTransitionWatcher() {
+    if (!this.transitionTimer) return;
+    clearInterval(this.transitionTimer);
+    this.transitionTimer = null;
+  }
+
   requireRegistry() {
     if (!this.registry) {
       const error = new Error("workspace registry is not ready");
@@ -551,6 +613,9 @@ export class WidgetBridge {
       return (rows?.items ?? [])
         .map((row) => normalizeSession(row))
         .filter((session) => !archived.has(String(session.id)))
+        .filter((session) => session.origin !== "subagent")
+        // 0 消息的空会话在手机上点开就是一页白，默认不列。
+        .filter((session) => session.blank !== true)
         .filter((session) => !index.get(String(session.id)));
     } catch {
       return [];
@@ -656,12 +721,14 @@ export class WidgetBridge {
     this.port = address.port;
     this.started = true;
     this.writeDiscovery();
+    this.startTransitionWatcher();
     this.logger.log("[dsh-widget-bridge] listening on " + this.host + ":" + String(this.port));
     return this;
   }
 
   async stop() {
     this.stopping = true;
+    this.stopTransitionWatcher();
     for (const controller of this.activeStreams) {
       try { controller.abort(); } catch {}
     }
@@ -820,17 +887,16 @@ export class WidgetBridge {
     if (pathname === "/v1/pair/start" && req.method === "POST") {
       this.requirePrimary(identity);
       const body = await readBody(req);
-      const ticket = this.pairing.start();
       // The QR payload carries every reachable base URL, so the phone keeps
       // working when it leaves the LAN and falls back to the tunnel.
-      const addrs = this.pairCandidates();
+      const ticket = this.pairingTicket();
       this.audit.record({
         event: "pair-start",
         ip,
         label: typeof body.label === "string" ? body.label.slice(0, 60) : null,
         expiresAt: ticket.expiresAt,
       });
-      json(res, 200, { ...ticket, addrs, uri: pairingURI(addrs[0], ticket.code, addrs) });
+      json(res, 200, ticket);
       return;
     }
     if (pathname === "/v1/devices" && req.method === "GET") {
@@ -883,9 +949,40 @@ export class WidgetBridge {
     }
 
     if (pathname === "/v1/workspaces" && req.method === "GET") {
+      // 计数必须与 /v1/sessions 同口径：子代理、空会话、归档都不算。
+      // 之前按 workspace.sessionIds 的长度算，但那份列表里还留着已归档会话和
+      // 查不到的旧 id —— 实测工作区显示 13 条、点开只有 5 条，就是对不上。
+      const perWorkspace = new Map();
+      try {
+        const rows = await this.requireController().list({}, undefined);
+        const archived = this.archivedSessionSet();
+        const index = this.sessionWorkspaceIndex();
+        for (const row of rows?.items ?? []) {
+          const id = String(row?.sessionId ?? row?.id);
+          if (row?.origin === "subagent") continue;
+          if (row?.blank === true) continue;
+          if (archived.has(id)) continue;
+          const workspaceId = index.get(id);
+          if (!workspaceId) continue;
+          const bucket = perWorkspace.get(workspaceId) ?? { count: 0, running: 0 };
+          bucket.count += 1;
+          if (row?.running === true) bucket.running += 1;
+          perWorkspace.set(workspaceId, bucket);
+        }
+      } catch {
+        // A paused host should still list workspaces; the lamps just stay off.
+      }
       const list =
         this.registry && typeof this.registry.list === "function" ? this.registry.list() : [];
-      const workspaces = list.map(normalizeWorkspace).sort((a, b) => b.updatedAt - a.updatedAt);
+      const workspaces = list
+        .map((workspace) => {
+          const normalized = normalizeWorkspace(workspace);
+          const bucket = perWorkspace.get(String(workspace.id)) ?? { count: 0, running: 0 };
+          normalized.sessionCount = bucket.count;
+          normalized.runningCount = bucket.running;
+          return normalized;
+        })
+        .sort((a, b) => b.updatedAt - a.updatedAt);
       const ungrouped = await this.ungroupedSessions();
       if (ungrouped.length > 0) {
         workspaces.push({
@@ -893,6 +990,7 @@ export class WidgetBridge {
           title: "未分组",
           path: "",
           sessionCount: ungrouped.length,
+          runningCount: ungrouped.filter((session) => session.running === true).length,
           updatedAt: Math.max(...ungrouped.map((session) => session.updatedAt || 0)),
         });
       }
@@ -906,22 +1004,45 @@ export class WidgetBridge {
       const includeArchived = ["1", "true"].includes(
         String(url.searchParams.get("includeArchived") ?? "").toLowerCase(),
       );
+      const includeSubagents = ["1", "true"].includes(
+        String(url.searchParams.get("includeSubagents") ?? "").toLowerCase(),
+      );
+      const includeBlank = ["1", "true"].includes(
+        String(url.searchParams.get("includeBlank") ?? "").toLowerCase(),
+      );
       const workspaceFilter = url.searchParams.get("workspaceId");
       const index = this.sessionWorkspaceIndex();
       let sessions = (rows?.items ?? []).map((row) => {
         const session = normalizeSession(row);
         session.workspaceId = index.get(String(session.id)) ?? null;
         session.archived = archived.has(String(session.id));
+        // 这一轮结束的时刻由 bridge 常驻记录：App 被系统回收后重启，
+        // 本地基线没了，只能靠它把黄灯补回来。已读走 /read 清掉。
+        session.endedAt = this.endedAt.get(String(session.id)) ?? null;
         return session;
       });
       // Archived sessions are hidden by default: they are dead ends on a phone.
       if (!includeArchived) sessions = sessions.filter((session) => session.archived !== true);
+      // Subagent sessions are delegated work of another turn: their history only
+      // opens through the parent, so listing them on the phone is a dead end.
+      if (!includeSubagents) sessions = sessions.filter((session) => session.origin !== "subagent");
+      // 0 消息的空会话点开就是一页白，默认不列（手机端每次新建都会留下一条）。
+      if (!includeBlank) sessions = sessions.filter((session) => session.blank !== true);
       if (workspaceFilter === UNGROUPED_WORKSPACE_ID) {
         sessions = sessions.filter((session) => !session.workspaceId);
       } else if (workspaceFilter) {
         sessions = sessions.filter((session) => session.workspaceId === workspaceFilter);
       }
       json(res, 200, { sessions });
+      return;
+    }
+
+    // 看过就把未读清掉。手机进入/离开会话时调用；bridge 这条记录也要清，
+    // 否则 App 重启后会把已经看过的会话重新点亮。
+    const readMatch = /^\/v1\/sessions\/([^/]+)\/read$/.exec(pathname);
+    if (readMatch && req.method === "POST") {
+      this.endedAt.delete(decodeURIComponent(readMatch[1]));
+      json(res, 200, { ok: true });
       return;
     }
 
@@ -1465,6 +1586,21 @@ export class WidgetBridge {
     if (!urls.length) urls.push("http://127.0.0.1:" + String(this.port));
     return urls;
   }
+
+  /**
+   * Issue one pairing ticket and its QR payload.
+   *
+   * The desktop app, `/v1/pair/start` and the settings panel all hand a phone
+   * the same thing, so the ticket is built in one place: a fresh code, every
+   * reachable base URL (LAN first, tunnel last) and the custom-scheme URI that
+   * encodes both.
+   * @returns the ticket fields, the address list, and the pairing URI.
+   */
+  pairingTicket() {
+    const ticket = this.pairing.start();
+    const addrs = this.pairCandidates();
+    return { ...ticket, addrs, uri: pairingURI(addrs[0], ticket.code, addrs) };
+  }
 }
 
 export const name = "dsh-widget-bridge";
@@ -1546,9 +1682,23 @@ export function apply(ctx, rawConfig = {}) {
   } else {
     console.error("[dsh-widget-bridge] sessionController is unavailable");
   }
+  // The settings panel rides on the DSH web host, not on the bridge listener:
+  // the bridge rejects browser-originated requests, so the panel reads this
+  // live instance instead and no token is ever handed to a page.
+  let panelDispose;
+  try {
+    if (typeof ctx.inject === "function") {
+      panelDispose = ctx.inject(["webServer", "connection"], (scoped) =>
+        attachPanel(bridge, scoped, (message) => console.error("[dsh-widget-bridge] " + message)),
+      );
+    }
+  } catch (error) {
+    console.error("[dsh-widget-bridge] panel inject failed: " + String(error?.message ?? error));
+  }
   return () => {
     disposed = true;
     try { injectDispose?.(); } catch {}
+    try { panelDispose?.(); } catch {}
     void bridge.stop();
   };
 }
