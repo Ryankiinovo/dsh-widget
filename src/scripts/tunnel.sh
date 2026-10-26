@@ -21,8 +21,19 @@ resolve_port() {
   printf '%s' "${port:-$DEFAULT_PORT}"
 }
 URL_FILE="$HOME/.dsh/widget-public-url"
-PID_FILE="/tmp/cloudflared-dsh.pid"
-LOG_FILE="/tmp/cloudflared-dsh.log"
+LOG_DIR="${HOME}/Library/Logs/dshwidget"
+mkdir -p "$LOG_DIR"
+PID_FILE="${LOG_DIR}/cloudflared.pid"
+LOG_FILE="${LOG_DIR}/cloudflared.log"
+LOG_MAX_BYTES=$((5 * 1024 * 1024))
+
+# cloudflared 自己不做轮转：拉起前把超过 5MB 的日志挪成 .1（只留一代）。
+rotate_log() {
+  local file="$1" size
+  if [ ! -f "$file" ]; then return 0; fi
+  size="$(wc -c <"$file" | tr -d ' ')"
+  if [ "${size:-0}" -gt "$LOG_MAX_BYTES" ]; then mv -f "$file" "${file}.1"; fi
+}
 
 say() { printf '%s\n' "$*"; }
 die() { printf '错误：%s\n' "$*" >&2; exit 1; }
@@ -96,6 +107,7 @@ cmd_start() {
     rm -f "$PID_FILE"
   fi
 
+  rotate_log "$LOG_FILE"
   : > "$LOG_FILE"
   nohup "$cf" tunnel --url "http://127.0.0.1:${port}" --no-autoupdate \
     --logfile "$LOG_FILE" >/dev/null 2>&1 &
@@ -147,6 +159,7 @@ cmd_run() {
   cf="$(find_cloudflared)"
   port="$(resolve_port)"
   say "launchd 模式启动：指向 127.0.0.1:${port}"
+  rotate_log "$LOG_FILE"
   : > "$LOG_FILE"
   "$cf" tunnel --url "http://127.0.0.1:${port}" --no-autoupdate --logfile "$LOG_FILE" &
   pid=$!

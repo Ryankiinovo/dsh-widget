@@ -15,12 +15,17 @@ DEST_DIR="$HOME/Library/Application Support/dshwidget-tunnel"
 DEST="$DEST_DIR/tunnel.sh"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 SRC="$(cd "$(dirname "$0")" && pwd)/tunnel.sh"
+LOG_DIR="$HOME/Library/Logs/dshwidget"
 
 say() { printf '%s\n' "$*"; }
 uid_num() { id -u; }
 
 install_service() {
-  mkdir -p "$DEST_DIR" "$(dirname "$PLIST")"
+  mkdir -p "$DEST_DIR" "$(dirname "$PLIST")" "$LOG_DIR"
+  # launchd 自己不会切日志：装/更新时把旧文件挪成 .1，避免无限增长。
+  for f in "$LOG_DIR/tunnel.out.log" "$LOG_DIR/tunnel.err.log"; do
+    if [ -f "$f" ] && [ "$(wc -c <"$f" | tr -d ' ')" -gt 5242880 ]; then mv -f "$f" "${f}.1"; fi
+  done
   cp "$SRC" "$DEST"
   chmod 755 "$DEST"
   say "脚本副本：$DEST"
@@ -45,9 +50,9 @@ install_service() {
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>StandardOutPath</key>
-	<string>/tmp/dsh-tunnel-launchd.out</string>
+	<string>${LOG_DIR}/tunnel.out.log</string>
 	<key>StandardErrorPath</key>
-	<string>/tmp/dsh-tunnel-launchd.err</string>
+	<string>${LOG_DIR}/tunnel.err.log</string>
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
@@ -60,7 +65,7 @@ PLIST
 
   # 先停掉手工起的隧道，避免两条抢同一个 bridge
   pkill -f 'cloudflared tunnel --url http://127.0.0.1' 2>/dev/null || true
-  rm -f /tmp/cloudflared-dsh.pid
+  rm -f "$LOG_DIR/cloudflared.pid"
   sleep 1
 
   launchctl bootout "gui/$(uid_num)/${LABEL}" 2>/dev/null || true

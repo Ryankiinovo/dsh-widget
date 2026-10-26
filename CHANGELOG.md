@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 隧道日志不再写 `/tmp`，统一到 `~/Library/Logs/dshwidget/`：`cloudflared.log`（超过 5 MB 自动轮转为 `.1`）、`tunnel.out.log`、`tunnel.err.log`、`cloudflared.pid`；`install-launchd.sh` 重新安装时也会轮转旧文件。`/tmp` 重启即清空，放那里既留不住证据也看不出长期趋势。
+
 ## [0.5.0] - 2026-10-25
 
 ### Fixed
