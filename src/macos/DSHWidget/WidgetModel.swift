@@ -55,6 +55,10 @@ final class WidgetModel: ObservableObject {
     @Published private(set) var liveRunningIDs: Set<String> = []
     @Published var connection: Connection = .waiting
     @Published var errorText: String?
+    /// A host restart owns the status line while it runs, so the widget never
+    /// reports "DSH 未连接" for what is actually a deliberate ~15s restart.
+    @Published var isRestarting = false
+    @Published var restartError: String?
     @Published var scrollTick: Int = 0
 
     private var client: BridgeClient?
@@ -116,6 +120,58 @@ final class WidgetModel: ObservableObject {
     func start() {
         guard connectTask == nil else { return }
         beginConnection()
+    }
+
+    /// Quit and relaunch the DSH app, then reconnect. The old process needs ~10s
+    /// to exit and a cold start another ~10-15s, so "重启中…" stays up until the
+    /// bridge actually answers — otherwise the panel shows "DSH 未连接" during a
+    /// perfectly normal restart and reads as a failure.
+    func restartHost() {
+        guard !isRestarting else { return }
+        isRestarting = true
+        restartError = nil
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await DSHRestarter.restart()
+            } catch is CancellationError {
+                self.isRestarting = false
+                return
+            } catch {
+                self.restartError = error.localizedDescription
+                self.isRestarting = false
+                return
+            }
+            self.restartConnection()
+            // Phase 1: wait for the host process to actually disappear. Without
+            // this the first poll still sees `connection == .connected` (the app
+            // has not received the SIGTERM yet) and reports success half a second
+            // in, which reads as "flashed green, went dark, came back".
+            var sawDown = false
+            for _ in 0..<40 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if !DSHRestarter.isRunning() {
+                    sawDown = true
+                    break
+                }
+            }
+            WidgetLog.event("restart-down", "sawDown=\(sawDown)")
+            // Phase 2: the launchd job retries the launch itself, so this loop
+            // only waits for the bridge to come back and records what happened.
+            for _ in 0..<120 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if self.connection == .connected {
+                    self.isRestarting = false
+                    WidgetLog.event("restart-done")
+                    return
+                }
+                if !DSHRestarter.isRunning() {
+                    WidgetLog.event("restart-watchdog", "still-down")
+                }
+            }
+            self.isRestarting = false
+            self.restartError = "DSH 没连上，点电源再试一次"
+        }
     }
 
     private func beginConnection() {

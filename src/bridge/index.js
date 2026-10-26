@@ -10,6 +10,7 @@
  *   files, process memory, or the launch URL token.
  */
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -66,12 +67,79 @@ const CAPABILITIES = Object.freeze({
   multiDevice: true,
   workspaces: true,
   archivedFilter: true,
+  dshRestart: true,
 });
+
+const DSH_APP_PATH = "/Applications/DeepSeek Harness.app";
+const DSH_EXECUTABLE_PATH = DSH_APP_PATH + "/Contents/MacOS/DeepSeek Harness";
+
+/**
+ * Quits and relaunches the DSH app that hosts this bridge.
+ *
+ * Measured on this machine (2026-10-26): SIGTERM on the main Electron process
+ * (ppid 1) exits it in ~10s, and `open -a` brings the bridge back on the same
+ * port ~4s later. The pid from /v1/health is the Host *subprocess*, so killing
+ * that one leaves the window alive with no bridge — an apparent success that
+ * restarts nothing. The script therefore matches ppid 1 and an exact command
+ * line instead.
+ *
+ * It is spawned detached and unref'd: it has to outlive this process, and the
+ * SIGTERM it sends must not reach the shell that sent it.
+ */
+// Launching the app from inside the DSH process tree does not work: this
+// bridge SIGTERMs the app and LaunchServices then silently drops the relaunch
+// request (exit 0, no process, not even a log line). Measured 2026-10-26: the
+// same `open -n` from a launchd job brings it back in about a second. So submit
+// a one-shot job that kills, waits, relaunches, and removes itself.
+const RESTART_LABEL = "com.ryankiin.dshwidget.bridge-restart";
+const RESTART_LOG = "/tmp/dsh-bridge-restart.log";
+
+function restartDSHHost(log = () => {}) {
+  const scriptPath = join("/tmp", "dsh-bridge-restart-" + randomUUID() + ".sh");
+  const script = [
+    "#!/bin/bash",
+    "exec >> " + RESTART_LOG + " 2>&1",
+    'echo "$(date \'+%H:%M:%S\') bridge restart start"',
+    "EXE=" + JSON.stringify(DSH_EXECUTABLE_PATH),
+    'main() { ps -Ao pid,ppid,command | awk -v exe="$EXE" \'$2 == 1 && substr($0, length($0) - length(exe) + 1) == exe { print $1; exit }\'; }',
+    'P=$(main)',
+    'echo "main=${P:-none}"',
+    '[ -n "$P" ] && kill -TERM "$P"',
+    'for i in $(seq 1 60); do sleep 0.5; [ -z "$(main)" ] && break; done',
+    'echo "$(date \'+%H:%M:%S\') exited"',
+    "sleep 2",
+    "for r in 1 2 3; do",
+    "  open -n -a " + JSON.stringify(DSH_APP_PATH),
+    '  echo "$(date \'+%H:%M:%S\') open exit=$? round=$r"',
+    "  N=",
+    '  for i in $(seq 1 40); do sleep 0.5; N=$(main); [ -n "$N" ] && break; done',
+    '  if [ -n "$N" ]; then echo "$(date \'+%H:%M:%S\') recovered pid=$N round=$r"; launchctl remove ' +
+      RESTART_LABEL + '; rm -f "$0"; exit 0; fi',
+    "done",
+    'echo "$(date \'+%H:%M:%S\') FAILED after 3 rounds"',
+    "launchctl remove " + RESTART_LABEL,
+    'rm -f "$0"',
+  ].join("\n");
+  try {
+    writeFileSync(scriptPath, script, { mode: 0o700 });
+  } catch (error) {
+    log("dsh restart script failed: " + String(error?.message ?? error));
+    return;
+  }
+  try {
+    spawn("/bin/launchctl", ["remove", RESTART_LABEL], { stdio: "ignore" }).on("error", () => {});
+    spawn("/bin/launchctl", ["submit", "-l", RESTART_LABEL, "--", "/bin/bash", scriptPath], {
+      stdio: "ignore",
+    }).on("error", (error) => log("dsh restart submit failed: " + String(error?.message ?? error)));
+  } catch (error) {
+    log("dsh restart submit failed: " + String(error?.message ?? error));
+  }
+}
+
 // maxMessages counts event records, not chat messages. Ask DSH for both a
 // bounded event window and a minimum conversation window so opening a long
 // session still shows a few rounds instead of only the latest tool events.
-const TURN_WINDOW = Object.freeze({ minMessages: 20, minTurns: 2 });
-// Sessions created before workspaces existed (or by an older host) carry no
+const TURN_WINDOW = Object.freeze({ minMessages: 20, minTurns: 2 });// Sessions created before workspaces existed (or by an older host) carry no
 // membership. Hiding them would make them unreachable from the phone, so they
 // surface under one synthetic bucket instead.
 const UNGROUPED_WORKSPACE_ID = "__ungrouped";
@@ -935,6 +1003,18 @@ export class WidgetBridge {
       return;
     }
     this.authLimiter.reset(ip);
+
+    if (pathname === "/v1/dsh/restart" && req.method === "POST") {
+      // Answer before acting: this bridge runs inside the process the script is
+      // about to SIGTERM. A full restart measured ~15s end to end, so the client
+      // polls /v1/health instead of holding this response open.
+      json(res, 200, { ok: true, restarting: true });
+      this.audit.record({ event: "dsh-restart", ip, deviceId: identity?.device?.id ?? null });
+      setImmediate(() => {
+        restartDSHHost((message) => console.error("[dsh-widget-bridge] " + message));
+      });
+      return;
+    }
 
     if (pathname === "/v1/endpoints" && req.method === "GET") {
       // 手机在局域网里连上时顺手把候选地址刷新一次：quick tunnel 重建后

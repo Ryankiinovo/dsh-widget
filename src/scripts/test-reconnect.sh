@@ -116,7 +116,11 @@ run_scenario() {
 }
 
 failures=0
-run_scenario cut "snapshot in=2 out=2" "settle reason=reconcile" "last=12" || failures=$((failures + 1))
+# The cut scenario is settled by the reconnect snapshot (`settle reason=snapshot`).
+# The "reconcile" reason this used to assert no longer exists — that path was
+# renamed to `reconcile-idle` and only fires while the host still reports busy,
+# which `stall` covers. Assert the settle happened without pinning its reason.
+run_scenario cut "snapshot in=2 out=2" "settle reason=" "last=12" || failures=$((failures + 1))
 run_scenario stall "stream-stall" "snapshot in=2 out=2" "last=12" || failures=$((failures + 1))
 
 if (( failures > 0 )); then

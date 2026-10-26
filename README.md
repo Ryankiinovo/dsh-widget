@@ -26,6 +26,7 @@ A macOS desktop widget for the DeepSeek Harness desktop app: keep the current se
 - Phone pairing: the QR button in the header opens a card (white-background QR, six-digit code, countdown, candidate addresses); the mobile client pairs by scanning. Paired device tokens can be revoked individually.
 - Pairing from the DSH settings page too: Settings → "Widget" shows whether the app is running (with a Start button when it is not) and generates a QR code plus six-digit code on demand, with a 120-second countdown and a Refresh button once it expires; the local and public addresses embedded in the code are listed underneath, flagged when the public one is unreachable. Pair a new device without opening the app.
 - Optional remote access: `src/scripts/tunnel.sh` starts a Cloudflare quick tunnel and writes the address to `~/.dsh/widget-public-url`; `install-launchd.sh` installs it as a user-level launchd service (starts at login, restarts on crash, survives DSH quitting). `GET /v1/endpoints` lets the client refresh candidate addresses, so a new tunnel hostname no longer requires re-pairing.
+- Restart DSH in one click: the power button left of the pairing icon on the widget restarts the DSH desktop app, and the iOS settings page offers the same action via `POST /v1/dsh/restart`. The relaunch runs inside a one-shot launchd job, because a plain `open` from a regular process is silently dropped while DSH is shutting down (exit code 0, nothing starts).
 
 ## Requirements
 

@@ -28,6 +28,7 @@ swiftc \
   "$ROOT/DSHWidget/BridgeClient.swift" \
   "$ROOT/DSHWidget/PairingView.swift" \
   "$ROOT/DSHWidget/WidgetModel.swift" \
+  "$ROOT/DSHWidget/DSHRestarter.swift" \
   "$ROOT/DSHWidget/MarkdownText.swift" \
   "$ROOT/DSHWidget/ContentView.swift" \
   "$ROOT/DSHWidget/ComposerKey.swift" \

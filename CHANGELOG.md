@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-26
+
+### Added
+
+- **App 右上角「重启 DSH」按钮**（`power`，在 `qrcode` 左侧，中间一条 14pt 竖分隔线）：确认后重启 DSH 桌面端，界面上不再需要 Cmd+Q 再手动打开。确认框用 `NSAlert.runModal()` 而不是 SwiftUI `.alert`——面板挂在 `desktopIconWindow + 1` 桌面层级，sheet 会被普通窗口盖住。
+- bridge 新增 `POST /v1/dsh/restart`（device token）与 `capabilities.dshRestart`，手机端设置页可以触发同一个动作。响应先回 200 再动手：这个请求由即将被重启的进程处理，不先回就发不出响应。
+
+### Changed
+
+- **重启改由一次性 launchd job 执行**：桌面端 `launchctl submit -l com.ryankiin.dshwidget.restart`、bridge 端 `com.ryankiin.dshwidget.bridge-restart`，脚本内按序「取主进程 pid（`ppid == 1`，不是 `/v1/health` 返回的 Host 子进程）→ `kill -TERM` → 等其消失 → `open -n -a` → 轮询新进程出现 → 末尾 `launchctl remove` 自清」。起因是实测发现：从普通进程（App 本身，或 DSH 进程树里 `spawn(detached)` 的脚本）在 DSH 刚被 `SIGTERM` 的瞬间发起 `open` / `NSWorkspace.openApplication`，**请求会被 LaunchServices 静默丢弃**——退出码 0、进程没出现、系统日志里连一条 launch 记录都没有；`createsNewApplicationInstance = true`、`open -n` 均无效，直接 exec 二进制则被系统 `SIGKILL`。同一时刻从 launchd job 里执行同样的 `open -n -a`，一秒内就起来。
+
+### Fixed
+
+- 桌面端点重启后状态栏「闪一下绿 → 断约 3 秒 → 再变绿」：等待逻辑改为先确认主进程真的消失（最多 20 秒），再开始计「已连上」，期间一直是「重启中…」。
+- `src/scripts/test-reconnect.sh` 的 `cut` 场景断言过时：它要求 `settle reason=reconcile`，而这个 reason 早已改名为 `reconcile-idle`，且只在宿主仍上报 busy 时才触发（那由 `stall` 场景覆盖）。改为断言「确实发生了结算且 `last=12`」，不锁死具体 reason。
+
 ## [0.7.0] - 2026-10-26
 
 ### Added

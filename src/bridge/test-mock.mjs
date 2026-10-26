@@ -196,6 +196,16 @@ try {
   const unauthorized = await fetch("http://127.0.0.1:" + discovery.port + "/v1/sessions");
   assert.equal(unauthorized.status, 401);
 
+  // The restart route kills and relaunches the real DSH, so it is only ever
+  // asserted for its auth gate here: a request without a token must never reach
+  // the spawn. Everything after the gate is exercised by hand on a real host.
+  const restartNoToken = await fetch("http://127.0.0.1:" + discovery.port + "/v1/dsh/restart", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(restartNoToken.status, 401);
+
   const headers = { authorization: "Bearer " + token };
   const list = await fetch("http://127.0.0.1:" + discovery.port + "/v1/sessions", { headers });
   assert.equal(list.status, 200);

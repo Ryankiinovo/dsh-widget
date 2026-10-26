@@ -72,6 +72,32 @@ struct ContentView: View {
         }
     }
 
+    /// The panel sits at the desktop window level, so a SwiftUI `.alert` sheet
+    /// would be covered by any normal window. A modal NSAlert raises above the
+    /// app, which is the only way the confirmation is guaranteed visible while
+    /// the panel is behind the DSH window.
+    private func confirmAndRestart() {
+        WidgetLog.event("restart-requested")
+        let alert = NSAlert()
+        alert.messageText = "重启 DeepSeek Harness？"
+        alert.informativeText = "会中断正在进行的回答，约 30 秒后自动恢复。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "重启")
+        alert.addButton(withTitle: "取消")
+        // The panel lives at the desktop window level, so an alert attached to it
+        // (a sheet) would be covered. Force the modal window above everything —
+        // otherwise the click looks like it did nothing.
+        alert.window.level = .floating
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.center()
+        alert.window.makeKeyAndOrderFront(nil)
+        let response = alert.runModal()
+        WidgetLog.event("restart-confirm", "response=\(response.rawValue)")
+        if response == .alertFirstButtonReturn {
+            model.restartHost()
+        }
+    }
+
     /// Running sessions get a green dot prefix; idle ones stay plain.
     static func sessionLabel(_ session: SessionSummary, running: Bool) -> AttributedString {
         var title = AttributedString(session.displayTitle)
@@ -158,6 +184,21 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .help("新建会话")
+
+            Divider()
+                .frame(height: 14)
+                .opacity(0.45)
+
+            Button {
+                confirmAndRestart()
+            } label: {
+                Image(systemName: "power")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(model.isRestarting)
+            .help(model.isRestarting ? "正在重启 DSH" : "重启 DSH")
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -514,7 +555,10 @@ struct ContentView: View {
             Circle()
                 .fill(connectionColor)
                 .frame(width: 5, height: 5)
-            Text(model.connection.label)
+            Text(model.isRestarting ? "重启中…" : model.connection.label)
+            if let restartError = model.restartError {
+                Text("· \(restartError)")
+            }
             if !model.visibleMessages.isEmpty {
                 Text("· \(model.visibleMessages.count) 条")
             }
@@ -526,6 +570,7 @@ struct ContentView: View {
     }
 
     private var connectionColor: Color {
+        if model.isRestarting { return .orange }
         switch model.connection {
         case .connected: return .green
         case .waiting: return .orange
