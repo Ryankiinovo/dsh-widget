@@ -110,12 +110,29 @@ struct ScrollObserver: NSViewRepresentable {
             observers.removeAll()
         }
 
+        private var lastOvershootReport = Date.distantPast
+
         private func report() {
             guard let scrollView else { return }
             let scroller = scrollView.verticalScroller
             let floatValue = CGFloat(scroller?.floatValue ?? 1)
             let overflows = (scroller?.knobProportion ?? 1) < 0.999
             onReport?(floatValue, overflows, liveScrolling)
+
+            // 「问完问题拖到最底，整屏都是空的」现场诊断（2026-10-26）：视口跑到
+            // 真实内容下方时，floatValue 依然是 1，只有量出来的高度能区分。
+            // 正常滚动永远不会进这里，所以按 2 秒节流就够。
+            let contentHeight = scrollView.documentView?.frame.height ?? 0
+            let offset = scrollView.contentView.bounds.origin.y
+            let viewport = scrollView.contentView.bounds.height
+            let slack = contentHeight - (offset + viewport)
+            if slack < -2, Date().timeIntervalSince(lastOvershootReport) > 2 {
+                lastOvershootReport = Date()
+                WidgetLog.event(
+                    "scroll-overshoot",
+                    "content=\(Int(contentHeight)) offset=\(Int(offset)) viewport=\(Int(viewport)) slack=\(Int(slack))"
+                )
+            }
         }
 
         deinit { detach() }

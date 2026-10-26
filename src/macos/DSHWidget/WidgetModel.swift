@@ -132,6 +132,9 @@ final class WidgetModel: ObservableObject {
         restartError = nil
         Task { [weak self] in
             guard let self else { return }
+            // Let the phones know first: they can only see a healthy bridge
+            // until the process actually dies, ~10s later.
+            await self.client?.notifyHostRestarting()
             do {
                 try await DSHRestarter.restart()
             } catch is CancellationError {

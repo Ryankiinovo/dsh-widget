@@ -82,6 +82,14 @@ final class BridgeClient {
 
     /// Opens a 6-digit pairing window. The ticket also carries the QR payload,
     /// so a phone gets scheme, base URL and code from a single scan.
+    /// Best effort: tell the bridge to drop every live stream so paired phones
+    /// switch to "reconnecting" the moment the Mac side starts its restart,
+    /// instead of staying green through the ~10s graceful shutdown.
+    struct HostNotice: Decodable { let ok: Bool }
+    func notifyHostRestarting() async {
+        _ = try? await perform(request(path: "/v1/host/restarting", method: "POST", json: [:]), as: HostNotice.self)
+    }
+
     func startPairing() async throws -> PairingTicket {
         try await perform(
             request(path: "v1/pair/start", method: "POST", json: ["label": "DSH 小组件"]),

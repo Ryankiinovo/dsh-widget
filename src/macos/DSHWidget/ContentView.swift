@@ -255,6 +255,7 @@ struct ContentView: View {
         // shove it around or leave it stranded above an older message.
         return ScrollViewReader { proxy in
             ScrollView {
+                VStack(spacing: 0) {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if model.visibleMessages.isEmpty {
                         VStack(spacing: 8) {
@@ -318,9 +319,13 @@ struct ContentView: View {
                             .padding(.top, 10)
                             .transition(.opacity)
                     }
-                    Color.clear
-                        .frame(height: 1)
-                        .id("bottom")
+                }
+                // 底部锚点必须待在 LazyVStack 外面：scrollTo 指向懒加载子项时
+                // SwiftUI 按估算位置滚动，视口会停在真实内容下方的一片空白里，
+                // 表现为「拖到最底全屏是空的，往回拖或者重开会话才恢复」。
+                Color.clear
+                    .frame(height: 1)
+                    .id("bottom")
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 12)

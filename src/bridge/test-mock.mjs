@@ -207,6 +207,37 @@ try {
   assert.equal(restartNoToken.status, 401);
 
   const headers = { authorization: "Bearer " + token };
+
+  // Two taps in a row must not queue two jobs: the second one would SIGTERM the
+  // host the first one just relaunched (measured 2026-10-26, phone side). The
+  // job itself is dry-run here — submitting for real would kill this DSH.
+  process.env.DSHWIDGET_RESTART_DRY_RUN = "1";
+  const restartFirst = await fetch("http://127.0.0.1:" + discovery.port + "/v1/dsh/restart", {
+    method: "POST",
+    headers,
+    body: "{}",
+  });
+  assert.equal(restartFirst.status, 200);
+  assert.equal((await restartFirst.json()).coalesced, undefined);
+  const restartSecond = await fetch("http://127.0.0.1:" + discovery.port + "/v1/dsh/restart", {
+    method: "POST",
+    headers,
+    body: "{}",
+  });
+  assert.equal(restartSecond.status, 200);
+  assert.equal((await restartSecond.json()).coalesced, true);
+
+  // Inside the restart window every other endpoint refuses, otherwise the phone
+  // reconnects to the dying process and flashes green mid-restart.
+  const duringRestart = await fetch("http://127.0.0.1:" + discovery.port + "/v1/sessions", {
+    headers,
+  });
+  assert.equal(duringRestart.status, 503);
+  assert.equal(duringRestart.headers.get("retry-after"), "5");
+
+  // The window is in-process state; clear it so the rest of the suite runs.
+  bridge.restartingUntil = 0;
+
   const list = await fetch("http://127.0.0.1:" + discovery.port + "/v1/sessions", { headers });
   assert.equal(list.status, 200);
   const listed = await list.json();

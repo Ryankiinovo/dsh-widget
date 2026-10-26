@@ -92,48 +92,84 @@ const DSH_EXECUTABLE_PATH = DSH_APP_PATH + "/Contents/MacOS/DeepSeek Harness";
 // same `open -n` from a launchd job brings it back in about a second. So submit
 // a one-shot job that kills, waits, relaunches, and removes itself.
 const RESTART_LABEL = "com.ryankiin.dshwidget.bridge-restart";
+
+/// How long the bridge keeps answering 503 after a restart is requested.
+/// Long enough for DSH's ~10s graceful exit plus a cold start, short enough
+/// that a failed restart self-heals instead of pinning the phone offline.
+const RESTART_GRACE_MS = 150_000;
+const RESTARTING_PATH = "/v1/host/restarting";
+const DSH_RESTART_PATH = "/v1/dsh/restart";
 const RESTART_LOG = "/tmp/dsh-bridge-restart.log";
+// Repeated taps must not stack jobs: the second one would SIGTERM the
+// host the first one just relaunched. One restart per window, and the
+// client gets an immediate, identical answer.
+const RESTART_COALESCE_MS = 60_000;
+let lastRestartAt = 0;
 
 function restartDSHHost(log = () => {}) {
-  const scriptPath = join("/tmp", "dsh-bridge-restart-" + randomUUID() + ".sh");
-  const script = [
-    "#!/bin/bash",
-    "exec >> " + RESTART_LOG + " 2>&1",
-    'echo "$(date \'+%H:%M:%S\') bridge restart start"',
-    "EXE=" + JSON.stringify(DSH_EXECUTABLE_PATH),
-    'main() { ps -Ao pid,ppid,command | awk -v exe="$EXE" \'$2 == 1 && substr($0, length($0) - length(exe) + 1) == exe { print $1; exit }\'; }',
-    'P=$(main)',
-    'echo "main=${P:-none}"',
-    '[ -n "$P" ] && kill -TERM "$P"',
-    'for i in $(seq 1 60); do sleep 0.5; [ -z "$(main)" ] && break; done',
-    'echo "$(date \'+%H:%M:%S\') exited"',
-    "sleep 2",
-    "for r in 1 2 3; do",
-    "  open -n -a " + JSON.stringify(DSH_APP_PATH),
-    '  echo "$(date \'+%H:%M:%S\') open exit=$? round=$r"',
-    "  N=",
-    '  for i in $(seq 1 40); do sleep 0.5; N=$(main); [ -n "$N" ] && break; done',
-    '  if [ -n "$N" ]; then echo "$(date \'+%H:%M:%S\') recovered pid=$N round=$r"; launchctl remove ' +
-      RESTART_LABEL + '; rm -f "$0"; exit 0; fi',
-    "done",
-    'echo "$(date \'+%H:%M:%S\') FAILED after 3 rounds"',
-    "launchctl remove " + RESTART_LABEL,
-    'rm -f "$0"',
-  ].join("\n");
-  try {
-    writeFileSync(scriptPath, script, { mode: 0o700 });
-  } catch (error) {
-    log("dsh restart script failed: " + String(error?.message ?? error));
+  // Tests assert the coalescing behaviour without killing this machine's DSH.
+  if (process.env.DSHWIDGET_RESTART_DRY_RUN === "1") {
+    log("dsh restart dry-run (no job submitted)");
     return;
   }
-  try {
-    spawn("/bin/launchctl", ["remove", RESTART_LABEL], { stdio: "ignore" }).on("error", () => {});
-    spawn("/bin/launchctl", ["submit", "-l", RESTART_LABEL, "--", "/bin/bash", scriptPath], {
-      stdio: "ignore",
-    }).on("error", (error) => log("dsh restart submit failed: " + String(error?.message ?? error)));
-  } catch (error) {
-    log("dsh restart submit failed: " + String(error?.message ?? error));
-  }
+  // A shared label races with its own removal: `launchctl submit` gets rejected
+  // while launchd is still tearing the previous job down, and with stdio
+  // ignored the failure left no trace (measured 2026-10-26: 2 of 4 taps did
+  // nothing at all). Give every attempt its own label, and read the result.
+  const submitOnce = (attempt) => {
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 8);
+    const label = RESTART_LABEL + "-" + suffix;
+    const scriptPath = join("/tmp", "dsh-bridge-restart-" + suffix + ".sh");
+    const script = [
+      "#!/bin/bash",
+      "exec >> " + RESTART_LOG + " 2>&1",
+      'echo "$(date \'+%H:%M:%S\') bridge restart start"',
+      "EXE=" + JSON.stringify(DSH_EXECUTABLE_PATH),
+      'main() { ps -Ao pid,ppid,command | awk -v exe="$EXE" \'$2 == 1 && substr($0, length($0) - length(exe) + 1) == exe { print $1; exit }\'; }',
+      'P=$(main)',
+      'echo "main=${P:-none}"',
+      '[ -n "$P" ] && kill -TERM "$P"',
+      'for i in $(seq 1 60); do sleep 0.5; [ -z "$(main)" ] && break; done',
+      'echo "$(date \'+%H:%M:%S\') exited"',
+      "sleep 2",
+      "for r in 1 2 3; do",
+      "  open -n -a " + JSON.stringify(DSH_APP_PATH),
+      '  echo "$(date \'+%H:%M:%S\') open exit=$? round=$r"',
+      "  N=",
+      '  for i in $(seq 1 40); do sleep 0.5; N=$(main); [ -n "$N" ] && break; done',
+      '  if [ -n "$N" ]; then echo "$(date \'+%H:%M:%S\') recovered pid=$N round=$r"; launchctl remove ' +
+        label + '; rm -f "$0"; exit 0; fi',
+      "done",
+      'echo "$(date \'+%H:%M:%S\') FAILED after 3 rounds"',
+      "launchctl remove " + label,
+      'rm -f "$0"',
+    ].join("\n");
+    try {
+      writeFileSync(scriptPath, script, { mode: 0o700 });
+    } catch (error) {
+      log("dsh restart script failed: " + String(error?.message ?? error));
+      return;
+    }
+    let output = "";
+    const child = spawn("/bin/launchctl", ["submit", "-l", label, "--", "/bin/bash", scriptPath], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      output += chunk;
+    });
+    child.on("error", (error) => {
+      log("dsh restart submit failed: " + String(error?.message ?? error));
+    });
+    child.on("close", (code) => {
+      const detail = output.trim();
+      log("dsh restart submit exit=" + code + (detail ? " " + detail : ""));
+      if (code !== 0 && attempt < 1) submitOnce(attempt + 1);
+    });
+  };
+  submitOnce(0);
 }
 
 // maxMessages counts event records, not chat messages. Ask DSH for both a
@@ -474,6 +510,7 @@ export class WidgetBridge {
     this.publicMode =
       options.publicMode ??
       (this.host !== "127.0.0.1" && this.host !== "localhost" && this.host !== "::1");
+    this.restartingUntil = 0;
     this.pairing = new PairingStore({ ttlMs: options.pairingTtlMs ?? PAIRING_TTL_MS });
     this.devices = new DeviceStore({ path: options.devicesPath ?? DEFAULT_DEVICES });
     this.audit = new AuditLog({ path: options.auditPath ?? DEFAULT_AUDIT });
@@ -1004,10 +1041,55 @@ export class WidgetBridge {
     }
     this.authLimiter.reset(ip);
 
+    // While a restart is in flight, every other endpoint answers 503. Aborting
+    // the streams alone is not enough: DSH stays alive for ~10s while it shuts
+    // down gracefully, so the phone would reconnect instantly and go green
+    // again in the middle of a restart. Failing until the new process takes
+    // over keeps the lamp on "reconnecting" for the whole window.
+    if (
+      this.restartingUntil > Date.now() &&
+      pathname !== RESTARTING_PATH &&
+      pathname !== DSH_RESTART_PATH
+    ) {
+      res.setHeader("retry-after", "5");
+      json(res, 503, { error: { code: "gateway/restarting", message: "host is restarting" } });
+      return;
+    }
+
+    if (pathname === "/v1/host/restarting" && req.method === "POST") {
+      // Tell every live stream the host is about to go away. Without this the
+      // phone keeps a healthy looking connection for the ~10s DSH spends
+      // shutting down gracefully, so its lamp stays green exactly when the user
+      // has just pressed restart on the Mac and expects "reconnecting".
+      const notified = this.activeStreams.size;
+      this.restartingUntil = Date.now() + RESTART_GRACE_MS;
+      json(res, 200, { ok: true, notified });
+      for (const controller of this.activeStreams) {
+        try {
+          controller.abort();
+        } catch {
+          // Already closed.
+        }
+      }
+      return;
+    }
     if (pathname === "/v1/dsh/restart" && req.method === "POST") {
+      const now = Date.now();
+      if (now - lastRestartAt < RESTART_COALESCE_MS) {
+        // Already relaunching; a second job would kill the fresh host.
+        json(res, 200, { ok: true, restarting: true, coalesced: true });
+        this.audit.record({
+          event: "dsh-restart-coalesced",
+          ip,
+          deviceId: identity?.device?.id ?? null,
+        });
+        return;
+      }
+      lastRestartAt = now;
       // Answer before acting: this bridge runs inside the process the script is
       // about to SIGTERM. A full restart measured ~15s end to end, so the client
       // polls /v1/health instead of holding this response open.
+      this.restartingUntil = Date.now() + RESTART_GRACE_MS;
       json(res, 200, { ok: true, restarting: true });
       this.audit.record({ event: "dsh-restart", ip, deviceId: identity?.device?.id ?? null });
       setImmediate(() => {
